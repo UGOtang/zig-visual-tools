@@ -264,7 +264,7 @@ function runArtifact(artifact: BuildArtifact, workspaceRoot: string | undefined)
     terminal.sendText(`"${artifact.absolutePath}"`);
 }
 
-function debugArtifact(artifact: BuildArtifact, workspaceRoot: string | undefined) {
+async function debugArtifact(artifact: BuildArtifact, workspaceRoot: string | undefined) {
     if (!workspaceRoot || !artifact.absolutePath) {
         vscode.window.showErrorMessage('Cannot debug artifact: missing path information.');
         return;
@@ -275,12 +275,78 @@ function debugArtifact(artifact: BuildArtifact, workspaceRoot: string | undefine
         return;
     }
 
-    const terminal = vscode.window.createTerminal({
-        name: `Debug: ${artifact.name}`,
-        cwd: workspaceRoot
-    });
-    terminal.show();
-    terminal.sendText(`lldb "${artifact.absolutePath}"`);
+    const config = vscode.workspace.getConfiguration('zigVisualTools');
+    const debuggerChoice = config.get<string>('debugger', 'gdb');
+
+    const workspaceFolder = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(workspaceRoot));
+
+    if (debuggerChoice === 'lldb') {
+        // Use CodeLLDB extension (vadimcn.vscode-lldb)
+        const debugConfig: vscode.DebugConfiguration = {
+            type: 'lldb',
+            name: `Debug ${artifact.name}`,
+            request: 'launch',
+            program: artifact.absolutePath,
+            cwd: workspaceRoot,
+            args: [],
+            stopAtEntry: false
+        };
+
+        let success = false;
+        try {
+            success = await vscode.debug.startDebugging(workspaceFolder, debugConfig);
+        } catch {
+            // CodeLLDB not installed or misconfigured
+        }
+
+        if (!success) {
+            vscode.window.showErrorMessage(
+                'Failed to start LLDB debug session. Make sure the CodeLLDB extension (vadimcn.vscode-lldb) is installed.',
+                'Install CodeLLDB'
+            ).then(choice => {
+                if (choice === 'Install CodeLLDB') {
+                    vscode.commands.executeCommand('workbench.extensions.installExtension', 'vadimcn.vscode-lldb');
+                }
+            });
+        }
+    } else {
+        // Use GDB via C/C++ extension (ms-vscode.cpptools) — default
+        const debugConfig: vscode.DebugConfiguration = {
+            type: 'cppdbg',
+            name: `Debug ${artifact.name}`,
+            request: 'launch',
+            program: artifact.absolutePath,
+            cwd: workspaceRoot,
+            args: [],
+            stopAtEntry: false,
+            MIMode: 'gdb',
+            setupCommands: [
+                {
+                    description: 'Enable pretty-printing for gdb',
+                    text: '-enable-pretty-printing',
+                    ignoreFailures: true
+                }
+            ]
+        };
+
+        let success = false;
+        try {
+            success = await vscode.debug.startDebugging(workspaceFolder, debugConfig);
+        } catch {
+            // C/C++ extension not installed or misconfigured
+        }
+
+        if (!success) {
+            vscode.window.showErrorMessage(
+                'Failed to start GDB debug session. Make sure the C/C++ extension (ms-vscode.cpptools) is installed.',
+                'Install C/C++ Extension'
+            ).then(choice => {
+                if (choice === 'Install C/C++ Extension') {
+                    vscode.commands.executeCommand('workbench.extensions.installExtension', 'ms-vscode.cpptools');
+                }
+            });
+        }
+    }
 }
 
 function rebuildArtifact(artifact: BuildArtifact, workspaceRoot: string | undefined) {

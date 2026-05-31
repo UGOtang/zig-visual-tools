@@ -12,6 +12,24 @@
   "activationEvents": [],
   "main": "./dist/extension.js",
   "contributes": {
+    "configuration": {
+      "title": "Zig Visual Tools",
+      "properties": {
+        "zigVisualTools.debugger": {
+          "type": "string",
+          "default": "gdb",
+          "enum": [
+            "gdb",
+            "lldb"
+          ],
+          "enumDescriptions": [
+            "Use GDB via C/C++ extension (cppdbg) — requires ms-vscode.cpptools",
+            "Use LLDB via CodeLLDB extension (lldb) — requires vadimcn.vscode-lldb"
+          ],
+          "description": "Debugger backend to use when debugging Zig build artifacts. Make sure the corresponding VS Code extension is installed."
+        }
+      }
+    },
     "viewsContainers": {
       "activitybar": [
         {
