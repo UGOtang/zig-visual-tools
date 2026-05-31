@@ -3,7 +3,7 @@
   "displayName": "Zig Visual Tools",
   "description": "Visualize Zig build steps, artifacts, source files, and tests in VS Code",
   "version": "0.1.0",
-  "publisher": "",
+  "publisher": "ugotang",
   "license": "MIT",
   "engines": {
     "vscode": "^1.120.0"
