@@ -26,6 +26,10 @@
         {
           "id": "zigBuildTargets",
           "name": "Build Targets"
+        },
+        {
+          "id": "zigBuildArtifacts",
+          "name": "Build Artifacts"
         }
       ]
     },
@@ -39,6 +43,31 @@
         "command": "zig-visual-tools.refreshBuildTargets",
         "title": "Refresh Build Targets",
         "icon": "$(refresh)"
+      },
+      {
+        "command": "zig-visual-tools.refreshBuildArtifacts",
+        "title": "Refresh Build Artifacts",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "zig-visual-tools.runArtifact",
+        "title": "Run Artifact",
+        "icon": "$(play)"
+      },
+      {
+        "command": "zig-visual-tools.debugArtifact",
+        "title": "Debug Artifact",
+        "icon": "$(debug-alt)"
+      },
+      {
+        "command": "zig-visual-tools.rebuildArtifact",
+        "title": "Rebuild Artifact",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "zig-visual-tools.openArtifactFolder",
+        "title": "Open in Explorer",
+        "icon": "$(folder)"
       }
     ],
     "menus": {
@@ -47,6 +76,11 @@
           "command": "zig-visual-tools.refreshBuildTargets",
           "when": "view == zigBuildTargets",
           "group": "navigation"
+        },
+        {
+          "command": "zig-visual-tools.refreshBuildArtifacts",
+          "when": "view == zigBuildArtifacts",
+          "group": "navigation"
         }
       ],
       "view/item/context": [
@@ -54,6 +88,26 @@
           "command": "zig-visual-tools.runStep",
           "when": "view == zigBuildTargets",
           "group": "inline"
+        },
+        {
+          "command": "zig-visual-tools.runArtifact",
+          "when": "viewItem == zigArtifactExe",
+          "group": "inline@1"
+        },
+        {
+          "command": "zig-visual-tools.debugArtifact",
+          "when": "viewItem == zigArtifactExe",
+          "group": "inline@2"
+        },
+        {
+          "command": "zig-visual-tools.rebuildArtifact",
+          "when": "viewItem =~ /zigArtifact/",
+          "group": "inline@3"
+        },
+        {
+          "command": "zig-visual-tools.openArtifactFolder",
+          "when": "viewItem =~ /zigArtifact/",
+          "group": "inline@4"
         }
       ]
     }

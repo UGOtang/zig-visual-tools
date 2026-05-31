@@ -2,6 +2,13 @@ import * as vscode from 'vscode';
 import * as cp from 'child_process';
 import * as path from 'path';
 import * as fs from 'fs';
+import type { BuildArtifact, BuildSummary } from './types';
+import {
+    fetchBuildSummary,
+    getExecutables,
+    getLibraries,
+    artifactExists
+} from './buildParser';
 
 // ============================================================================
 // Extension Activation
@@ -44,7 +51,81 @@ export function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(treeView, runStepDisposable, refreshDisposable);
 
     // ----------------------------------------
-    // 2. Test Controller (Test Explorer)
+    // 2. Build Artifacts TreeView
+    // ----------------------------------------
+    const artifactsProvider = new BuildArtifactsProvider(workspaceRoot);
+    const artifactsTreeView = vscode.window.createTreeView('zigBuildArtifacts', {
+        treeDataProvider: artifactsProvider,
+        showCollapseAll: true
+    });
+
+    // Register refresh artifacts command
+    const refreshArtifactsDisposable = vscode.commands.registerCommand(
+        'zig-visual-tools.refreshBuildArtifacts',
+        () => {
+            artifactsProvider.refresh();
+        }
+    );
+
+    // Register run artifact command
+    const runArtifactDisposable = vscode.commands.registerCommand(
+        'zig-visual-tools.runArtifact',
+        (node: ArtifactTreeItem) => {
+            if (!node || !node.artifact) {
+                vscode.window.showWarningMessage('No artifact selected.');
+                return;
+            }
+            runArtifact(node.artifact, workspaceRoot);
+        }
+    );
+
+    // Register debug artifact command
+    const debugArtifactDisposable = vscode.commands.registerCommand(
+        'zig-visual-tools.debugArtifact',
+        (node: ArtifactTreeItem) => {
+            if (!node || !node.artifact) {
+                vscode.window.showWarningMessage('No artifact selected.');
+                return;
+            }
+            debugArtifact(node.artifact, workspaceRoot);
+        }
+    );
+
+    // Register rebuild artifact command
+    const rebuildArtifactDisposable = vscode.commands.registerCommand(
+        'zig-visual-tools.rebuildArtifact',
+        (node: ArtifactTreeItem) => {
+            if (!node || !node.artifact) {
+                vscode.window.showWarningMessage('No artifact selected.');
+                return;
+            }
+            rebuildArtifact(node.artifact, workspaceRoot);
+        }
+    );
+
+    // Register open artifact folder command
+    const openFolderDisposable = vscode.commands.registerCommand(
+        'zig-visual-tools.openArtifactFolder',
+        (node: ArtifactTreeItem) => {
+            if (!node || !node.artifact) {
+                vscode.window.showWarningMessage('No artifact selected.');
+                return;
+            }
+            openArtifactFolder(node.artifact);
+        }
+    );
+
+    context.subscriptions.push(
+        artifactsTreeView,
+        refreshArtifactsDisposable,
+        runArtifactDisposable,
+        debugArtifactDisposable,
+        rebuildArtifactDisposable,
+        openFolderDisposable
+    );
+
+    // ----------------------------------------
+    // 3. Test Controller (Test Explorer)
     // ----------------------------------------
     const testController = vscode.tests.createTestController(
         'zigTestController',
@@ -109,6 +190,73 @@ function runBuildStep(stepName: string, workspaceRoot: string | undefined) {
     });
     terminal.show();
     terminal.sendText(`zig build ${stepName}`);
+}
+
+// ============================================================================
+// Artifact Actions
+// ============================================================================
+
+function runArtifact(artifact: BuildArtifact, workspaceRoot: string | undefined) {
+    if (!workspaceRoot || !artifact.absolutePath) {
+        vscode.window.showErrorMessage('Cannot run artifact: missing path information.');
+        return;
+    }
+
+    if (!artifactExists(artifact)) {
+        vscode.window.showErrorMessage(`Artifact does not exist: ${artifact.name}. Build it first.`);
+        return;
+    }
+
+    const terminal = vscode.window.createTerminal({
+        name: `Run: ${artifact.name}`,
+        cwd: workspaceRoot
+    });
+    terminal.show();
+    terminal.sendText(`"${artifact.absolutePath}"`);
+}
+
+function debugArtifact(artifact: BuildArtifact, workspaceRoot: string | undefined) {
+    if (!workspaceRoot || !artifact.absolutePath) {
+        vscode.window.showErrorMessage('Cannot debug artifact: missing path information.');
+        return;
+    }
+
+    if (!artifactExists(artifact)) {
+        vscode.window.showErrorMessage(`Artifact does not exist: ${artifact.name}. Build it first.`);
+        return;
+    }
+
+    const terminal = vscode.window.createTerminal({
+        name: `Debug: ${artifact.name}`,
+        cwd: workspaceRoot
+    });
+    terminal.show();
+    terminal.sendText(`lldb "${artifact.absolutePath}"`);
+}
+
+function rebuildArtifact(artifact: BuildArtifact, workspaceRoot: string | undefined) {
+    if (!workspaceRoot) {
+        vscode.window.showErrorMessage('No workspace folder open.');
+        return;
+    }
+
+    const terminal = vscode.window.createTerminal({
+        name: `Rebuild: ${artifact.name}`,
+        cwd: workspaceRoot
+    });
+    terminal.show();
+    // Run the build step for this artifact
+    terminal.sendText(`zig build ${artifact.name} && echo "Build succeeded: ${artifact.name}"`);
+}
+
+function openArtifactFolder(artifact: BuildArtifact) {
+    if (!artifact.absolutePath) {
+        vscode.window.showErrorMessage('Cannot find artifact location.');
+        return;
+    }
+
+    const folderPath = path.dirname(artifact.absolutePath);
+    vscode.commands.executeCommand('revealFileInOS', vscode.Uri.file(folderPath));
 }
 
 // ============================================================================
@@ -264,6 +412,150 @@ class ZigStepItem extends vscode.TreeItem {
 }
 
 // ============================================================================
+// Build Artifacts Tree Provider
+// ============================================================================
+
+class BuildArtifactsProvider implements vscode.TreeDataProvider<ArtifactTreeItem> {
+    private _onDidChangeTreeData: vscode.EventEmitter<ArtifactTreeItem | undefined | null | void> =
+        new vscode.EventEmitter<ArtifactTreeItem | undefined | null | void>();
+    readonly onDidChangeTreeData: vscode.Event<ArtifactTreeItem | undefined | null | void> =
+        this._onDidChangeTreeData.event;
+
+    private summary: BuildSummary | null = null;
+
+    constructor(private workspaceRoot: string | undefined) {}
+
+    refresh(): void {
+        this.summary = null;
+        this._onDidChangeTreeData.fire();
+    }
+
+    getTreeItem(element: ArtifactTreeItem): vscode.TreeItem {
+        return element;
+    }
+
+    async getChildren(element?: ArtifactTreeItem): Promise<ArtifactTreeItem[]> {
+        if (!this.workspaceRoot) {
+            return [new ArtifactTreeItem(
+                'no-workspace',
+                'No workspace folder open',
+                vscode.TreeItemCollapsibleState.None,
+                'placeholder'
+            )];
+        }
+
+        // If we have an element, show its children (dependencies)
+        if (element && element.children && element.children.length > 0) {
+            return element.children;
+        }
+
+        // Load build summary if not cached
+        if (!this.summary) {
+            try {
+                this.summary = await fetchBuildSummary(this.workspaceRoot);
+            } catch (err) {
+                const errorMessage = err instanceof Error ? err.message : String(err);
+                return [new ArtifactTreeItem(
+                    'error',
+                    `Error: ${errorMessage}`,
+                    vscode.TreeItemCollapsibleState.None,
+                    'placeholder'
+                )];
+            }
+        }
+
+        // Root level: show categories
+        if (!element) {
+            const items: ArtifactTreeItem[] = [];
+
+            // Executables
+            const exes = getExecutables(this.summary);
+            if (exes.length > 0) {
+                const exeFolder = new ArtifactTreeItem(
+                    'executables',
+                    'Executables',
+                    vscode.TreeItemCollapsibleState.Expanded,
+                    'folder',
+                    new vscode.ThemeIcon('package')
+                );
+                exeFolder.children = exes.map(artifact => this.createArtifactItem(artifact));
+                items.push(exeFolder);
+            }
+
+            // Libraries
+            const libs = getLibraries(this.summary);
+            if (libs.length > 0) {
+                const libFolder = new ArtifactTreeItem(
+                    'libraries',
+                    'Libraries',
+                    vscode.TreeItemCollapsibleState.Expanded,
+                    'folder',
+                    new vscode.ThemeIcon('library')
+                );
+                libFolder.children = libs.map(artifact => this.createArtifactItem(artifact));
+                items.push(libFolder);
+            }
+
+            // Summary info
+            const info = new ArtifactTreeItem(
+                'summary',
+                `${this.summary.succeededSteps}/${this.summary.totalSteps} steps`,
+                vscode.TreeItemCollapsibleState.None,
+                'info',
+                new vscode.ThemeIcon('info')
+            );
+            info.description = this.summary.success ? '✓ Build succeeded' : '✗ Build failed';
+            items.push(info);
+
+            return items;
+        }
+
+        return [];
+    }
+
+    private createArtifactItem(artifact: BuildArtifact): ArtifactTreeItem {
+        const exists = artifactExists(artifact);
+        const contextValue = artifact.kind === 'exe' ? 'zigArtifactExe' : 'zigArtifactLib';
+
+        const item = new ArtifactTreeItem(
+            artifact.name,
+            artifact.name,
+            vscode.TreeItemCollapsibleState.None,
+            contextValue,
+            artifact.kind === 'exe'
+                ? new vscode.ThemeIcon('play')
+                : new vscode.ThemeIcon('file-binary'),
+            artifact
+        );
+
+        // Add status indicator
+        item.description = exists ? '✓' : '✗ Not built';
+        item.tooltip = artifact.path;
+
+        if (artifact.optimize) {
+            item.description += ` [${artifact.optimize}]`;
+        }
+
+        return item;
+    }
+}
+
+class ArtifactTreeItem extends vscode.TreeItem {
+    children?: ArtifactTreeItem[];
+
+    constructor(
+        public readonly id: string,
+        public readonly label: string,
+        public readonly collapsibleState: vscode.TreeItemCollapsibleState,
+        public readonly contextValue: string,
+        public readonly iconPath?: vscode.ThemeIcon,
+        public readonly artifact?: BuildArtifact
+    ) {
+        super(label, collapsibleState);
+    }
+}
+
+// ============================================================================
 // Test Discovery and Execution
 // ============================================================================
 
@@ -306,8 +598,6 @@ async function updateTestsForFile(
     }
 
     // Parse test declarations
-    // Match patterns: test "name" { or test "name" {
-    // Also match: test name { for identifier-only names
     const testRegex = /test\s+(?:"([^"]+)"|([a-zA-Z_][a-zA-Z0-9_]*))\s*\{/g;
     let match;
 
@@ -319,7 +609,7 @@ async function updateTestsForFile(
             continue;
         }
 
-        // Create unique ID: relative path from workspace + test name
+        // Create unique ID
         const workspaceFolder = vscode.workspace.getWorkspaceFolder(fileUri);
         const relativePath = workspaceFolder
             ? path.relative(workspaceFolder.uri.fsPath, filePath)
@@ -381,8 +671,6 @@ async function runTests(
 
         run.started(test);
 
-        // Build test command
-        // For tests with quoted names: zig test file.zig --test-filter "test name"
         const testName = test.label;
         const cmd = `zig test "${filePath}" --test-filter "${testName}"`;
 
@@ -393,21 +681,19 @@ async function runTests(
                     {
                         cwd: workspaceRoot,
                         timeout: 60000,
-                        maxBuffer: 1024 * 1024 * 10 // 10MB buffer
+                        maxBuffer: 1024 * 1024 * 10
                     },
                     (error: cp.ExecException | null, stdout: string, stderr: string) => {
                         if (token.isCancellationRequested) {
                             run.skipped(test);
                         } else if (error) {
-                            // Test failed
                             const message = stderr || stdout || error.message;
                             const testMessage = new vscode.TestMessage(message);
-                            // Try to extract line number from error output
                             const lineMatch = message.match(new RegExp(
                                 `${path.basename(filePath)}:(\\d+):(\\d+):`
                             ));
                             if (lineMatch) {
-                                const line = parseInt(lineMatch[1], 10) - 1; // Convert to 0-indexed
+                                const line = parseInt(lineMatch[1], 10) - 1;
                                 const col = parseInt(lineMatch[2], 10);
                                 testMessage.location = new vscode.Location(
                                     test.uri!,
@@ -416,7 +702,6 @@ async function runTests(
                             }
                             run.failed(test, testMessage);
                         } else {
-                            // Test passed
                             run.passed(test);
                         }
                         resolve();
