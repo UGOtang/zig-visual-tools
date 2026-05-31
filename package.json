@@ -2,9 +2,18 @@
   "name": "zig-visual-tools",
   "displayName": "Zig Visual Tools",
   "description": "Visualize Zig build steps, artifacts, source files, and tests in VS Code",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "ugotang",
   "license": "MIT",
+  "icon": "resources/zig-icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/UGOtang/zig-visual-tools.git"
+  },
+  "homepage": "https://github.com/UGOtang/zig-visual-tools#readme",
+  "bugs": {
+    "url": "https://github.com/UGOtang/zig-visual-tools/issues"
+  },
   "engines": {
     "vscode": "^1.120.0"
   },
@@ -20,7 +29,11 @@
     "Testing",
     "Other"
   ],
-  "activationEvents": [],
+  "activationEvents": [
+    "workspaceContains:build.zig",
+    "workspaceContains:**/*.zig",
+    "onLanguage:zig"
+  ],
   "main": "./dist/extension.js",
   "contributes": {
     "configuration": {

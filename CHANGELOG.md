@@ -4,6 +4,13 @@ All notable changes to the "zig-visual-tools" extension will be documented in th
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.1.1] - 2026-05-31
+
+### Added
+
+- Extension icon for Marketplace display
+- Repository, homepage, and bugs links in package.json
+
 ## [0.1.0] - 2026-05-31
 
 ### Added
