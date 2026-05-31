@@ -72,6 +72,8 @@ export interface BuildArtifact {
     sourceFiles?: ArtifactSourceFile[];
     /** Whether this is a test executable */
     isTest?: boolean;
+    /** Whether this is a dynamic/shared library (only applicable when kind is 'lib') */
+    isDynamic?: boolean;
     /** Link-time dependencies (other artifacts this needs at link time) */
     dependencies?: ArtifactDependency[];
     /** Size of the artifact file in bytes */

@@ -223,9 +223,33 @@ function parseStepContent(content: string, workspaceRoot: string): {
         const name = remaining.slice('compile lib '.length).trim();
         const parts = name.split(/\s+/);
         const artifactName = parts[0] || name;
+        const optimize = parts[1] as 'Debug' | 'ReleaseSafe' | 'ReleaseFast' | 'ReleaseSmall' | undefined;
+        const target = parts[2];
 
         // Libraries can be static (.a) or shared (.so/.dylib/.dll)
-        const staticPath = path.join(workspaceRoot, 'zig-out', 'lib', `lib${artifactName}.a`);
+        // Check all possible library paths
+        const libPaths = [
+            { path: path.join(workspaceRoot, 'zig-out', 'lib', `lib${artifactName}.a`), name: `lib${artifactName}.a`, kind: 'lib' as const },
+            { path: path.join(workspaceRoot, 'zig-out', 'lib', `lib${artifactName}.so`), name: `lib${artifactName}.so`, kind: 'lib' as const },
+            { path: path.join(workspaceRoot, 'zig-out', 'lib', `lib${artifactName}.dylib`), name: `lib${artifactName}.dylib`, kind: 'lib' as const },
+            { path: path.join(workspaceRoot, 'zig-out', 'lib', `${artifactName}.dll`), name: `${artifactName}.dll`, kind: 'lib' as const },
+            { path: path.join(workspaceRoot, 'zig-out', 'lib', `${artifactName}.lib`), name: `${artifactName}.lib`, kind: 'lib' as const },
+            { path: path.join(workspaceRoot, 'zig-cache', 'lib', `lib${artifactName}.a`), name: `lib${artifactName}.a`, kind: 'lib' as const },
+        ];
+
+        let artifactPath = libPaths[0].path;  // Default to static lib path
+        let artifactFileName = libPaths[0].name;
+        let isDynamic = false;
+
+        // Find the actual existing library file
+        for (const lib of libPaths) {
+            if (fs.existsSync(lib.path)) {
+                artifactPath = lib.path;
+                artifactFileName = lib.name;
+                isDynamic = lib.name.endsWith('.so') || lib.name.endsWith('.dylib') || lib.name.endsWith('.dll');
+                break;
+            }
+        }
 
         return {
             name: artifactName,
@@ -234,8 +258,12 @@ function parseStepContent(content: string, workspaceRoot: string): {
             artifact: {
                 name: artifactName,
                 kind: 'lib',
-                path: `zig-out/lib/lib${artifactName}.a`,
-                absolutePath: staticPath
+                path: `zig-out/lib/${artifactFileName}`,
+                absolutePath: artifactPath,
+                optimize: optimize === 'Debug' || optimize === 'ReleaseSafe' || optimize === 'ReleaseFast' || optimize === 'ReleaseSmall' ? optimize : undefined,
+                target,
+                // Mark if this is a dynamic/shared library
+                isDynamic: isDynamic  // Mark if this is a dynamic/shared library
             },
             duration,
             memory
@@ -244,11 +272,43 @@ function parseStepContent(content: string, workspaceRoot: string): {
 
     if (remaining.startsWith('compile obj ')) {
         const name = remaining.slice('compile obj '.length).trim();
+        const parts = name.split(/\s+/);
+        const artifactName = parts[0] || name;
+        const optimize = parts[1] as 'Debug' | 'ReleaseSafe' | 'ReleaseFast' | 'ReleaseSmall' | undefined;
+        const target = parts[2];
+
+        // Object files are typically in zig-out/obj/ or zig-cache/
+        const objPaths = [
+            { path: path.join(workspaceRoot, 'zig-out', 'obj', `${artifactName}.o`), name: `${artifactName}.o` },
+            { path: path.join(workspaceRoot, 'zig-out', 'obj', `${artifactName}.obj`), name: `${artifactName}.obj` },
+            { path: path.join(workspaceRoot, 'zig-cache', 'obj', `${artifactName}.o`), name: `${artifactName}.o` },
+            { path: path.join(workspaceRoot, 'zig-cache', `${artifactName}.o`), name: `${artifactName}.o` },
+        ];
+
+        let artifactPath = objPaths[0].path;
+        let artifactFileName = objPaths[0].name;
+
+        // Find the actual existing object file
+        for (const obj of objPaths) {
+            if (fs.existsSync(obj.path)) {
+                artifactPath = obj.path;
+                artifactFileName = obj.name;
+                break;
+            }
+        }
 
         return {
-            name,
+            name: artifactName,
             type: 'compile_obj',
             status,
+            artifact: {
+                name: artifactName,
+                kind: 'obj',
+                path: `zig-out/obj/${artifactFileName}`,
+                absolutePath: artifactPath,
+                optimize: optimize === 'Debug' || optimize === 'ReleaseSafe' || optimize === 'ReleaseFast' || optimize === 'ReleaseSmall' ? optimize : undefined,
+                target
+            },
             duration,
             memory
         };
@@ -257,10 +317,59 @@ function parseStepContent(content: string, workspaceRoot: string): {
     if (remaining.startsWith('install ')) {
         const name = remaining.slice('install '.length).trim();
 
+        // install step in build.zig copies artifact to zig-out/
+        // Try to determine what kind of artifact is being installed
+        let installPath: string | undefined;
+        let installedArtifact: BuildArtifact | undefined;
+
+        // Check common install locations based on artifact type inference
+        // Executables go to zig-out/bin/
+        // Libraries go to zig-out/lib/
+        // Headers go to zig-out/include/
+
+        // Try executable path first
+        const exePath = path.join(workspaceRoot, 'zig-out', 'bin', name);
+        if (fs.existsSync(exePath)) {
+            installPath = `zig-out/bin/${name}`;
+            installedArtifact = {
+                name,
+                kind: 'exe',
+                path: installPath,
+                absolutePath: exePath
+            };
+        } else {
+            // Try library paths (static and dynamic)
+            const libNames = [
+                `lib${name}.a`,                    // Static library (Unix)
+                `lib${name}.so`,                   // Shared library (Linux)
+                `lib${name}.dylib`,                // Shared library (macOS)
+                `${name}.dll`,                     // Shared library (Windows)
+                `${name}.lib`,                     // Static library (Windows)
+                `${name}.a`,                       // Static library (bare name)
+            ];
+
+            for (const libName of libNames) {
+                const libPath = path.join(workspaceRoot, 'zig-out', 'lib', libName);
+                if (fs.existsSync(libPath)) {
+                    installPath = `zig-out/lib/${libName}`;
+                    const isDynamic = libName.endsWith('.so') || libName.endsWith('.dylib') || libName.endsWith('.dll');
+                    installedArtifact = {
+                        name,
+                        kind: 'lib',
+                        path: installPath,
+                        absolutePath: libPath,
+                        isDynamic: isDynamic
+                    };
+                    break;
+                }
+            }
+        }
+
         return {
             name,
             type: 'install',
-            status
+            status,
+            artifact: installedArtifact
         };
     }
 

@@ -394,8 +394,18 @@ async function buildGraphVisualization(
         const statusIcon = exists ? '✓' : '✗';
         const fileSizeStr = formatFileSize(artifact.fileSize);
 
+        // Determine artifact kind description
+        let kindDesc: string;
+        if (artifact.kind === 'exe') {
+            kindDesc = artifact.isTest ? 'Test Executable' : 'Executable';
+        } else if (artifact.kind === 'lib') {
+            kindDesc = artifact.isDynamic ? 'Shared Library' : 'Static Library';
+        } else {
+            kindDesc = 'Object File';
+        }
+
         lines.push(`┌─ ${statusIcon} ${artifact.name}`);
-        lines.push(`│  Kind: ${artifact.kind === 'exe' ? 'Executable' : 'Library'}`);
+        lines.push(`│  Kind: ${kindDesc}`);
         lines.push(`│  Path: ${artifact.path}`);
 
         if (artifact.optimize) {
@@ -438,10 +448,24 @@ async function buildGraphVisualization(
     lines.push('═══════════════════════════════════════════');
     lines.push('Summary:');
     lines.push(`  Total artifacts: ${graphContext.artifacts.length}`);
-    const exeCount = graphContext.artifacts.filter(a => a.kind === 'exe').length;
-    const libCount = graphContext.artifacts.filter(a => a.kind === 'lib').length;
+    const exeCount = graphContext.artifacts.filter(a => a.kind === 'exe' && !a.isTest).length;
+    const testCount = graphContext.artifacts.filter(a => a.kind === 'exe' && a.isTest).length;
+    const staticLibCount = graphContext.artifacts.filter(a => a.kind === 'lib' && !a.isDynamic).length;
+    const dynamicLibCount = graphContext.artifacts.filter(a => a.kind === 'lib' && a.isDynamic).length;
+    const objCount = graphContext.artifacts.filter(a => a.kind === 'obj').length;
     lines.push(`  Executables: ${exeCount}`);
-    lines.push(`  Libraries: ${libCount}`);
+    if (testCount > 0) {
+        lines.push(`  Test Executables: ${testCount}`);
+    }
+    if (staticLibCount > 0) {
+        lines.push(`  Static Libraries: ${staticLibCount}`);
+    }
+    if (dynamicLibCount > 0) {
+        lines.push(`  Shared Libraries: ${dynamicLibCount}`);
+    }
+    if (objCount > 0) {
+        lines.push(`  Object Files: ${objCount}`);
+    }
 
     return lines.join('\n');
 }
@@ -667,8 +691,8 @@ class BuildArtifactsProvider implements vscode.TreeDataProvider<ArtifactTreeItem
         if (!element) {
             const items: ArtifactTreeItem[] = [];
 
-            // Executables
-            const exes = this.enrichedArtifacts.filter(a => a.kind === 'exe');
+            // Executables (filter out test executables to a separate category)
+            const exes = this.enrichedArtifacts.filter(a => a.kind === 'exe' && !a.isTest);
             if (exes.length > 0) {
                 const exeFolder = new ArtifactTreeItem(
                     'executables',
@@ -681,18 +705,35 @@ class BuildArtifactsProvider implements vscode.TreeDataProvider<ArtifactTreeItem
                 items.push(exeFolder);
             }
 
-            // Libraries
+            // Libraries - separate static and dynamic
             const libs = this.enrichedArtifacts.filter(a => a.kind === 'lib');
             if (libs.length > 0) {
-                const libFolder = new ArtifactTreeItem(
-                    'libraries',
-                    'Libraries',
-                    vscode.TreeItemCollapsibleState.Expanded,
-                    'folder',
-                    new vscode.ThemeIcon('library')
-                );
-                libFolder.children = libs.map(artifact => this.createArtifactItem(artifact));
-                items.push(libFolder);
+                const staticLibs = libs.filter(l => !l.isDynamic);
+                const dynamicLibs = libs.filter(l => l.isDynamic);
+
+                if (staticLibs.length > 0) {
+                    const staticFolder = new ArtifactTreeItem(
+                        'static-libraries',
+                        `Static Libraries (${staticLibs.length})`,
+                        vscode.TreeItemCollapsibleState.Expanded,
+                        'folder',
+                        new vscode.ThemeIcon('library')
+                    );
+                    staticFolder.children = staticLibs.map(artifact => this.createArtifactItem(artifact));
+                    items.push(staticFolder);
+                }
+
+                if (dynamicLibs.length > 0) {
+                    const dynamicFolder = new ArtifactTreeItem(
+                        'dynamic-libraries',
+                        `Shared Libraries (${dynamicLibs.length})`,
+                        vscode.TreeItemCollapsibleState.Expanded,
+                        'folder',
+                        new vscode.ThemeIcon('package')
+                    );
+                    dynamicFolder.children = dynamicLibs.map(artifact => this.createArtifactItem(artifact));
+                    items.push(dynamicFolder);
+                }
             }
 
             // Object files
@@ -700,13 +741,27 @@ class BuildArtifactsProvider implements vscode.TreeDataProvider<ArtifactTreeItem
             if (objs.length > 0) {
                 const objFolder = new ArtifactTreeItem(
                     'objects',
-                    'Object Files',
+                    `Object Files (${objs.length})`,
                     vscode.TreeItemCollapsibleState.Expanded,
                     'folder',
                     new vscode.ThemeIcon('file-binary')
                 );
                 objFolder.children = objs.map(artifact => this.createArtifactItem(artifact));
                 items.push(objFolder);
+            }
+
+            // Test executables
+            const tests = this.enrichedArtifacts.filter(a => a.kind === 'exe' && a.isTest);
+            if (tests.length > 0) {
+                const testFolder = new ArtifactTreeItem(
+                    'test-executables',
+                    `Test Executables (${tests.length})`,
+                    vscode.TreeItemCollapsibleState.Collapsed,
+                    'folder',
+                    new vscode.ThemeIcon('beaker')
+                );
+                testFolder.children = tests.map(artifact => this.createArtifactItem(artifact));
+                items.push(testFolder);
             }
 
             // Summary info
@@ -867,6 +922,18 @@ class BuildArtifactsProvider implements vscode.TreeDataProvider<ArtifactTreeItem
             infoChildren.push(optItem);
         }
 
+        // Library type (static vs dynamic)
+        if (artifact.kind === 'lib') {
+            const libTypeItem = new ArtifactTreeItem(
+                `libtype-${artifact.name}`,
+                `Type: ${artifact.isDynamic ? 'Shared Library (.so/.dylib/.dll)' : 'Static Library (.a)'}`,
+                vscode.TreeItemCollapsibleState.None,
+                'info-detail',
+                new vscode.ThemeIcon(artifact.isDynamic ? 'package' : 'library')
+            );
+            infoChildren.push(libTypeItem);
+        }
+
         // Target
         if (artifact.target) {
             const targetItem = new ArtifactTreeItem(
@@ -912,16 +979,25 @@ class BuildArtifactsProvider implements vscode.TreeDataProvider<ArtifactTreeItem
                             artifact.kind === 'lib' ? 'zigArtifactLib' :
                             'zigArtifactObj';
 
+        // Determine icon based on artifact kind and type
+        let icon: vscode.ThemeIcon;
+        if (artifact.kind === 'exe') {
+            icon = new vscode.ThemeIcon('play');
+        } else if (artifact.kind === 'lib') {
+            // Use different icon for dynamic vs static libraries
+            icon = artifact.isDynamic
+                ? new vscode.ThemeIcon('package')  // Dynamic/shared library
+                : new vscode.ThemeIcon('library'); // Static library
+        } else {
+            icon = new vscode.ThemeIcon('file-binary');
+        }
+
         const item = new ArtifactTreeItem(
             artifact.name,
             artifact.name,
             vscode.TreeItemCollapsibleState.Collapsed,
             contextValue,
-            artifact.kind === 'exe'
-                ? new vscode.ThemeIcon('play')
-                : artifact.kind === 'lib'
-                    ? new vscode.ThemeIcon('library')
-                    : new vscode.ThemeIcon('file-binary'),
+            icon,
             artifact
         );
 
@@ -931,6 +1007,11 @@ class BuildArtifactsProvider implements vscode.TreeDataProvider<ArtifactTreeItem
 
         if (artifact.optimize) {
             statusParts.push(`[${artifact.optimize}]`);
+        }
+
+        // Add library type indicator
+        if (artifact.kind === 'lib') {
+            statusParts.push(artifact.isDynamic ? '(shared)' : '(static)');
         }
 
         // Add file size if available
@@ -949,14 +1030,27 @@ class BuildArtifactsProvider implements vscode.TreeDataProvider<ArtifactTreeItem
         }
 
         item.description = statusParts.join(' ');
-        item.tooltip = `${artifact.name}\n` +
-            `Kind: ${artifact.kind}\n` +
-            `Path: ${artifact.path}\n` +
-            `${artifact.optimize ? `Build Mode: ${artifact.optimize}\n` : ''}` +
-            `${artifact.target ? `Target: ${artifact.target}\n` : ''}` +
-            `${exists ? `Size: ${formatFileSize(artifact.fileSize)}\n` : ''}` +
-            `Sources: ${artifact.sourceFiles?.length || 0}\n` +
-            `Dependencies: ${artifact.dependencies?.length || 0}`;
+
+        // Build tooltip with detailed info
+        let tooltipLines = [
+            `${artifact.name}`,
+            `Kind: ${artifact.kind === 'exe' ? 'Executable' : artifact.kind === 'lib' ? (artifact.isDynamic ? 'Shared Library' : 'Static Library') : 'Object File'}`,
+            `Path: ${artifact.path}`
+        ];
+
+        if (artifact.optimize) {
+            tooltipLines.push(`Build Mode: ${artifact.optimize}`);
+        }
+        if (artifact.target && artifact.target !== 'dynamic' && artifact.target !== 'static') {
+            tooltipLines.push(`Target: ${artifact.target}`);
+        }
+        if (exists && artifact.fileSize !== undefined) {
+            tooltipLines.push(`Size: ${formatFileSize(artifact.fileSize)}`);
+        }
+        tooltipLines.push(`Sources: ${artifact.sourceFiles?.length || 0}`);
+        tooltipLines.push(`Dependencies: ${artifact.dependencies?.length || 0}`);
+
+        item.tooltip = tooltipLines.join('\n');
 
         return item;
     }

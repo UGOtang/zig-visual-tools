@@ -27,7 +27,11 @@ import type {
  * Parse build.zig to find root source files associated with each artifact.
  * This scans for patterns like:
  *   b.addExecutable(.{ .name = "myexe", .root_module = ... })
- *   b.addLibrary(.{ .name = "mylib", .root_module = ... })
+ *   b.addStaticLibrary(.{ .name = "mylib", .root_module = ... })
+ *   b.addSharedLibrary(.{ .name = "mylib", .root_module = ... })
+ *   b.addObject(.{ .name = "myobj", .root_module = ... })
+ *
+ * Supports both modern Zig (0.12+) syntax with b.path() and older syntax.
  */
 export function parseBuildZig(workspaceRoot: string): Map<string, string[]> {
     const artifactSources = new Map<string, string[]>();
@@ -37,45 +41,133 @@ export function parseBuildZig(workspaceRoot: string): Map<string, string[]> {
         const content = fs.readFileSync(buildZigPath, 'utf8');
         const lines = content.split('\n');
 
-        // Find all addExecutable / addLibrary declarations and their root source files
+        // Find all addExecutable / addStaticLibrary / addSharedLibrary / addObject / addTest declarations
+        // and their root source files
         let currentArtifact: string | null = null;
+        let braceDepth = 0;
+        let inArtifactBlock = false;
 
         for (let i = 0; i < lines.length; i++) {
             const line = lines[i];
 
-            // Match: b.addExecutable(.{ .name = "artifact_name", ... })
-            const addMatch = line.match(/\.add(Executable|Library|Test|Object)\s*\(/);
+            // Match modern Zig 0.12+ syntax:
+            //   b.addExecutable(.{ .name = "artifact_name", ... })
+            //   b.addStaticLibrary(.{ .name = "artifact_name", ... })
+            //   b.addSharedLibrary(.{ .name = "artifact_name", ... })
+            //   b.addObject(.{ .name = "artifact_name", ... })
+            //   b.addTest(.{ .name = "artifact_name", ... })
+            // Also support older syntax:
+            //   b.addExecutable("name", "src/main.zig")
+            const modernMatch = line.match(/\.add(Executable|StaticLibrary|SharedLibrary|Object|Test)\s*\(/);
+            const legacyMatch = line.match(/\.add(Executable|Library|Test|Object)\s*\(/);
+            const addMatch = modernMatch || legacyMatch;
+
             if (addMatch) {
-                // Look for .name = "..." in the next few lines or same line
-                const blockText = extractBlockText(lines, i);
-                const nameMatch = blockText.match(/\.name\s*=\s*"([^"]+)"/);
-                if (nameMatch) {
-                    currentArtifact = nameMatch[1];
-                    if (!artifactSources.has(currentArtifact)) {
-                        artifactSources.set(currentArtifact, []);
+                // Check if this is modern syntax (.{ ... }) or legacy syntax
+                const isModern = line.includes('.{') || (i + 1 < lines.length && lines[i + 1].includes('.{'));
+
+                if (isModern) {
+                    // Look for .name = "..." in the next few lines or same line
+                    const blockText = extractBlockText(lines, i);
+                    const nameMatch = blockText.match(/\.name\s*=\s*"([^"]+)"/);
+                    if (nameMatch) {
+                        currentArtifact = nameMatch[1];
+                        if (!artifactSources.has(currentArtifact)) {
+                            artifactSources.set(currentArtifact, []);
+                        }
+                        inArtifactBlock = true;
+                        braceDepth = 0;
+                    }
+                } else {
+                    // Legacy syntax: b.addExecutable("name", "src/main.zig")
+                    const legacyNameMatch = line.match(/\(\s*"([^"]+)"\s*,/);
+                    const legacySrcMatch = line.match(/,\s*"([^"]+)"\s*\)/);
+
+                    if (legacyNameMatch) {
+                        currentArtifact = legacyNameMatch[1];
+                        if (!artifactSources.has(currentArtifact)) {
+                            artifactSources.set(currentArtifact, []);
+                        }
+
+                        // Legacy syntax often has the source file inline
+                        if (legacySrcMatch) {
+                            const srcPath = legacySrcMatch[1];
+                            const sources = artifactSources.get(currentArtifact);
+                            if (sources && !sources.includes(srcPath)) {
+                                sources.push(srcPath);
+                            }
+                        }
                     }
                 }
                 continue;
             }
 
-            // Match: .root_source_file = b.path("src/main.zig")
+            // Track brace depth to know when we exit the artifact configuration block
+            if (inArtifactBlock) {
+                for (const ch of line) {
+                    if (ch === '{') {
+                        braceDepth++;
+                    }
+                    if (ch === '}') {
+                        braceDepth--;
+                    }
+                }
+
+                if (braceDepth <= 0 && line.includes('})')) {
+                    inArtifactBlock = false;
+                    currentArtifact = null;
+                    continue;
+                }
+            }
+
+            // Match: .root_source_file = b.path("src/main.zig") - modern Zig 0.12+
             if (currentArtifact && line.includes('.root_source_file')) {
-                const srcMatch = line.match(/b\.path\s*\(\s*"([^"]+)"\s*\)/);
-                if (srcMatch) {
-                    const sources = artifactSources.get(currentArtifact);
-                    if (sources) {
-                        const srcPath = srcMatch[1];
-                        if (!sources.includes(srcPath)) {
+                // Try modern b.path() syntax first
+                const modernSrcMatch = line.match(/\.root_source_file\s*=\s*(?:b\.path\s*\(\s*"([^"]+)"\s*\)|\.\{\s*\.path\s*=\s*"([^"]+)"\s*\})/);
+                if (modernSrcMatch) {
+                    const srcPath = modernSrcMatch[1] || modernSrcMatch[2];
+                    if (srcPath) {
+                        const sources = artifactSources.get(currentArtifact);
+                        if (sources && !sources.includes(srcPath)) {
+                            sources.push(srcPath);
+                        }
+                    }
+                } else {
+                    // Try legacy .root_source_file = "src/main.zig" syntax
+                    const legacySrcMatch = line.match(/\.root_source_file\s*=\s*"([^"]+)"/);
+                    if (legacySrcMatch) {
+                        const srcPath = legacySrcMatch[1];
+                        const sources = artifactSources.get(currentArtifact);
+                        if (sources && !sources.includes(srcPath)) {
                             sources.push(srcPath);
                         }
                     }
                 }
             }
 
-            // Reset current artifact when we see a closing parenthesis at the right level
-            // or when we encounter a new top-level statement
-            if (currentArtifact && (line.match(/^\s*\)\s*;/) || line.match(/^\s*const\s/))) {
-                currentArtifact = null;
+            // Match: .root_module = b.createModule(.{ .root_source_file = ... }) - new module syntax
+            if (currentArtifact && line.includes('.root_module')) {
+                // Extract the module block and look for root_source_file within
+                const moduleBlock = extractBlockText(lines, i);
+                const srcMatch = moduleBlock.match(/\.root_source_file\s*=\s*(?:b\.path\s*\(\s*"([^"]+)"\s*\)|"([^"]+)")/);
+                if (srcMatch) {
+                    const srcPath = srcMatch[1] || srcMatch[2];
+                    if (srcPath) {
+                        const sources = artifactSources.get(currentArtifact);
+                        if (sources && !sources.includes(srcPath)) {
+                            sources.push(srcPath);
+                        }
+                    }
+                }
+            }
+
+            // Reset current artifact when we see certain patterns indicating end of block
+            if (currentArtifact && !inArtifactBlock) {
+                if (line.match(/^\s*\)\s*;?/) ||
+                    line.match(/^\s*\}\s*;?/) ||
+                    (line.match(/^\s*const\s/) && !line.includes('='))) {
+                    currentArtifact = null;
+                }
             }
         }
 
