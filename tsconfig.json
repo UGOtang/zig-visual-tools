@@ -1,0 +1,20 @@
+{
+	"compilerOptions": {
+		"module": "Node16",
+		"target": "ES2022",
+		"lib": [
+			"ES2022"
+		],
+		"sourceMap": true,
+		"rootDir": "src",
+		"strict": true,
+		"esModuleInterop": true,
+		"skipLibCheck": true,
+		"forceConsistentCasingInFileNames": true,
+		"resolveJsonModule": true,
+		"moduleResolution": "node16",
+		"types": ["node", "mocha"]
+	},
+	"include": ["src/**/*"],
+	"exclude": ["node_modules", ".vscode-test"]
+}

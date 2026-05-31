@@ -1,0 +1,88 @@
+{
+  "name": "zig-visual-tools",
+  "displayName": "zig-visual-tools",
+  "description": "Visual build steps and test explorer for Zig",
+  "version": "0.0.1",
+  "engines": {
+    "vscode": "^1.120.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "zig-visual-sidebar",
+          "title": "Zig Visual Tools",
+          "icon": "resources/zig-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "zig-visual-sidebar": [
+        {
+          "id": "zigBuildTargets",
+          "name": "Build Targets"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "zig-visual-tools.runStep",
+        "title": "Run Zig Build Step",
+        "icon": "$(play)"
+      },
+      {
+        "command": "zig-visual-tools.refreshBuildTargets",
+        "title": "Refresh Build Targets",
+        "icon": "$(refresh)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "zig-visual-tools.refreshBuildTargets",
+          "when": "view == zigBuildTargets",
+          "group": "navigation"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "zig-visual-tools.runStep",
+          "when": "view == zigBuildTargets",
+          "group": "inline"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "pnpm run package",
+    "compile": "pnpm run check-types && pnpm run lint && node esbuild.js",
+    "watch": "npm-run-all -p watch:*",
+    "watch:esbuild": "node esbuild.js --watch",
+    "watch:tsc": "tsc --noEmit --watch --project tsconfig.json",
+    "package": "pnpm run check-types && pnpm run lint && node esbuild.js --production",
+    "compile-tests": "tsc -p . --outDir out",
+    "watch-tests": "tsc -p . -w --outDir out",
+    "pretest": "pnpm run compile-tests && pnpm run compile && pnpm run lint",
+    "check-types": "tsc --noEmit",
+    "lint": "eslint src",
+    "test": "vscode-test"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.120.0",
+    "@types/mocha": "^10.0.10",
+    "@types/node": "22.x",
+    "typescript-eslint": "^8.56.1",
+    "eslint": "^9.39.3",
+    "esbuild": "^0.27.3",
+    "npm-run-all": "^4.1.5",
+    "typescript": "^5.9.3",
+    "@vscode/test-cli": "^0.0.12",
+    "@vscode/test-electron": "^2.5.2"
+  },
+  "packageManager": "pnpm@10.24.0+sha512.01ff8ae71b4419903b65c60fb2dc9d34cf8bb6e06d03bde112ef38f7a34d6904c424ba66bea5cdcf12890230bf39f9580473140ed9c946fef328b6e5238a345a"
+}
