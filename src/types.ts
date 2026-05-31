@@ -69,9 +69,49 @@ export interface BuildArtifact {
     /** Target triple (e.g., 'native', 'x86_64-linux') */
     target?: string;
     /** Source files that this artifact depends on */
-    sourceFiles?: string[];
+    sourceFiles?: ArtifactSourceFile[];
     /** Whether this is a test executable */
     isTest?: boolean;
+    /** Link-time dependencies (other artifacts this needs at link time) */
+    dependencies?: ArtifactDependency[];
+    /** Size of the artifact file in bytes */
+    fileSize?: number;
+}
+
+/**
+ * Information about a source file that belongs to an artifact
+ */
+export interface ArtifactSourceFile {
+    /** File name (e.g. 'main.zig') */
+    name: string;
+    /** Absolute path to the source file */
+    absolutePath: string;
+    /** Relative path from workspace root */
+    relativePath: string;
+    /** Whether this is the root source file of the artifact */
+    isRootSource: boolean;
+    /** Whether this source file is auto-generated (e.g. in zig-cache) */
+    isGenerated: boolean;
+    /** Number of lines in the source file */
+    lineCount?: number;
+    /** File size in bytes */
+    fileSize?: number;
+    /** Line number of this file reference in build.zig (if found) */
+    buildZigLine?: number;
+}
+
+/**
+ * Represents a dependency relationship between artifacts
+ */
+export interface ArtifactDependency {
+    /** Name of the dependency artifact */
+    name: string;
+    /** Kind of the dependency */
+    kind: 'exe' | 'lib' | 'obj';
+    /** Whether this dependency is transitively included */
+    isTransitive: boolean;
+    /** The build step for this dependency (if available) */
+    step?: BuildStep;
 }
 
 /**
@@ -92,6 +132,20 @@ export interface BuildSummary {
     artifacts: BuildArtifact[];
     /** Timestamp when the summary was generated */
     timestamp: Date;
+}
+
+/**
+ * Context for the build graph, containing all parsed information
+ */
+export interface BuildGraphContext {
+    /** Build summary from `zig build --summary all` */
+    summary: BuildSummary;
+    /** Artifacts with enriched source file information */
+    artifacts: BuildArtifact[];
+    /** Mapping from artifact name to its compile step */
+    artifactCompileSteps: Map<string, BuildStep>;
+    /** Mapping from artifact name to its dependencies (other artifacts it links) */
+    dependencyGraph: Map<string, ArtifactDependency[]>;
 }
 
 /**
@@ -120,6 +174,8 @@ export interface ArtifactTreeNode {
     step?: BuildStep;
     /** Resource URI (for file nodes) */
     resourceUri?: string;
+    /** Associated source file (if this node represents a source file) */
+    sourceFile?: ArtifactSourceFile;
 }
 
 /**

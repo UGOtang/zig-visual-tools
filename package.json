@@ -68,6 +68,21 @@
         "command": "zig-visual-tools.openArtifactFolder",
         "title": "Open in Explorer",
         "icon": "$(folder)"
+      },
+      {
+        "command": "zig-visual-tools.openSourceFile",
+        "title": "Open Source File",
+        "icon": "$(go-to-file)"
+      },
+      {
+        "command": "zig-visual-tools.showArtifactDependencies",
+        "title": "Show Artifact Dependencies",
+        "icon": "$(references)"
+      },
+      {
+        "command": "zig-visual-tools.showArtifactGraph",
+        "title": "Show Build Dependency Graph",
+        "icon": "$(graph)"
       }
     ],
     "menus": {
@@ -81,6 +96,11 @@
           "command": "zig-visual-tools.refreshBuildArtifacts",
           "when": "view == zigBuildArtifacts",
           "group": "navigation"
+        },
+        {
+          "command": "zig-visual-tools.showArtifactGraph",
+          "when": "view == zigBuildArtifacts",
+          "group": "navigation@1"
         }
       ],
       "view/item/context": [
@@ -108,6 +128,11 @@
           "command": "zig-visual-tools.openArtifactFolder",
           "when": "viewItem =~ /zigArtifact/",
           "group": "inline@4"
+        },
+        {
+          "command": "zig-visual-tools.showArtifactDependencies",
+          "when": "viewItem =~ /zigArtifact/",
+          "group": "inline@5"
         }
       ]
     }

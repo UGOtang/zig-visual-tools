@@ -1,0 +1,460 @@
+/**
+ * Parser for extracting source file dependencies and build graph from
+ * build.zig and `zig build --summary all` output.
+ *
+ * Inspired by CMake's visual target dependency graph, this module provides:
+ * - Source file extraction for each artifact
+ * - Dependency relationships between artifacts
+ * - Artifact-to-source-file mapping
+ */
+
+import * as path from 'path';
+import * as fs from 'fs';
+import type {
+    BuildArtifact,
+    ArtifactSourceFile,
+    ArtifactDependency,
+    BuildStep,
+    BuildSummary,
+    BuildGraphContext
+} from './types';
+
+// ============================================================================
+// build.zig Parser: Extract root source files for each artifact
+// ============================================================================
+
+/**
+ * Parse build.zig to find root source files associated with each artifact.
+ * This scans for patterns like:
+ *   b.addExecutable(.{ .name = "myexe", .root_module = ... })
+ *   b.addLibrary(.{ .name = "mylib", .root_module = ... })
+ */
+export function parseBuildZig(workspaceRoot: string): Map<string, string[]> {
+    const artifactSources = new Map<string, string[]>();
+    const buildZigPath = path.join(workspaceRoot, 'build.zig');
+
+    try {
+        const content = fs.readFileSync(buildZigPath, 'utf8');
+        const lines = content.split('\n');
+
+        // Find all addExecutable / addLibrary declarations and their root source files
+        let currentArtifact: string | null = null;
+
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i];
+
+            // Match: b.addExecutable(.{ .name = "artifact_name", ... })
+            const addMatch = line.match(/\.add(Executable|Library|Test|Object)\s*\(/);
+            if (addMatch) {
+                // Look for .name = "..." in the next few lines or same line
+                const blockText = extractBlockText(lines, i);
+                const nameMatch = blockText.match(/\.name\s*=\s*"([^"]+)"/);
+                if (nameMatch) {
+                    currentArtifact = nameMatch[1];
+                    if (!artifactSources.has(currentArtifact)) {
+                        artifactSources.set(currentArtifact, []);
+                    }
+                }
+                continue;
+            }
+
+            // Match: .root_source_file = b.path("src/main.zig")
+            if (currentArtifact && line.includes('.root_source_file')) {
+                const srcMatch = line.match(/b\.path\s*\(\s*"([^"]+)"\s*\)/);
+                if (srcMatch) {
+                    const sources = artifactSources.get(currentArtifact);
+                    if (sources) {
+                        const srcPath = srcMatch[1];
+                        if (!sources.includes(srcPath)) {
+                            sources.push(srcPath);
+                        }
+                    }
+                }
+            }
+
+            // Reset current artifact when we see a closing parenthesis at the right level
+            // or when we encounter a new top-level statement
+            if (currentArtifact && (line.match(/^\s*\)\s*;/) || line.match(/^\s*const\s/))) {
+                currentArtifact = null;
+            }
+        }
+
+        return artifactSources;
+    } catch (err) {
+        // If build.zig can't be read, return empty map
+        return artifactSources;
+    }
+}
+
+/**
+ * Extract multi-line block text starting from the given line
+ */
+function extractBlockText(lines: string[], startIndex: number): string {
+    let depth = 0;
+    let block = '';
+    let inBlock = false;
+
+    for (let i = startIndex; i < Math.min(startIndex + 50, lines.length); i++) {
+        const line = lines[i];
+
+        for (const ch of line) {
+            if (ch === '(') {
+                depth++;
+                inBlock = true;
+            } else if (ch === ')') {
+                depth--;
+            }
+        }
+
+        block += line + '\n';
+
+        if (inBlock && depth === 0) {
+            break;
+        }
+    }
+
+    return block;
+}
+
+// ============================================================================
+// Source File Discovery
+// ============================================================================
+
+/**
+ * Discover all .zig source files in the workspace that belong to a project.
+ * Excludes zig-cache and zig-out directories.
+ */
+export function discoverSourceFiles(workspaceRoot: string): string[] {
+    const sourceFiles: string[] = [];
+
+    try {
+        const entries = fs.readdirSync(workspaceRoot, { withFileTypes: true });
+
+        // Check for 'src' directory
+        const srcPath = path.join(workspaceRoot, 'src');
+        if (fs.existsSync(srcPath)) {
+            const stats = fs.statSync(srcPath);
+            if (stats.isDirectory()) {
+                collectZigFiles(srcPath, sourceFiles, workspaceRoot);
+            }
+        }
+
+        // Also check for .zig files in root
+        for (const entry of entries) {
+            if (entry.isFile() && entry.name.endsWith('.zig')) {
+                const fullPath = path.join(workspaceRoot, entry.name);
+                sourceFiles.push(fullPath);
+            }
+        }
+    } catch {
+        // Ignore errors
+    }
+
+    return sourceFiles;
+}
+
+/**
+ * Recursively collect .zig files from a directory
+ */
+function collectZigFiles(dirPath: string, result: string[], workspaceRoot: string): void {
+    try {
+        const entries = fs.readdirSync(dirPath, { withFileTypes: true });
+        for (const entry of entries) {
+            const fullPath = path.join(dirPath, entry.name);
+
+            if (entry.isDirectory()) {
+                // Skip zig-cache, zig-out, and hidden directories
+                if (entry.name === 'zig-cache' || entry.name === 'zig-out' || entry.name.startsWith('.')) {
+                    continue;
+                }
+                collectZigFiles(fullPath, result, workspaceRoot);
+            } else if (entry.isFile() && entry.name.endsWith('.zig')) {
+                result.push(fullPath);
+            }
+        }
+    } catch {
+        // Ignore permission errors
+    }
+}
+
+/**
+ * Get detailed info about a source file
+ */
+export function getSourceFileInfo(
+    absolutePath: string,
+    workspaceRoot: string,
+    isRootSource: boolean
+): ArtifactSourceFile | null {
+    try {
+        const stats = fs.statSync(absolutePath);
+        const relativePath = path.relative(workspaceRoot, absolutePath);
+        const name = path.basename(absolutePath);
+
+        // Count lines
+        const content = fs.readFileSync(absolutePath, 'utf8');
+        const lineCount = content.split('\n').length;
+
+        return {
+            name,
+            absolutePath,
+            relativePath,
+            isRootSource,
+            isGenerated: false,
+            lineCount,
+            fileSize: stats.size
+        };
+    } catch {
+        return null;
+    }
+}
+
+// ============================================================================
+// Dependency Graph Builder
+// ============================================================================
+
+/**
+ * Build a full build graph context from the summary and workspace.
+ * Enriches all artifacts with source file information and dependency data.
+ */
+export function buildBuildGraph(
+    summary: BuildSummary,
+    workspaceRoot: string
+): BuildGraphContext {
+    // 1. Get root source files from build.zig
+    const buildZigSources = parseBuildZig(workspaceRoot);
+
+    // 2. Discover all .zig files in the workspace
+    const allSourceFiles = discoverSourceFiles(workspaceRoot);
+
+    // 3. Build mapping from artifact name to its compile step
+    const artifactCompileSteps = new Map<string, BuildStep>();
+    for (const step of summary.allSteps) {
+        if (step.type === 'compile_exe' || step.type === 'compile_lib' || step.type === 'compile_obj') {
+            artifactCompileSteps.set(step.name, step);
+        }
+    }
+
+    // 4. Build dependency graph from the build step tree
+    const dependencyGraph = buildDependencyGraph(summary);
+
+    // 5. Enrich each artifact with source file info
+    const enrichedArtifacts = summary.artifacts.map(artifact => {
+        const enriched = { ...artifact };
+
+        // Get root source files from build.zig
+        const rootSources = buildZigSources.get(artifact.name) || [];
+
+        // Collect source files
+        const sourceFiles: ArtifactSourceFile[] = [];
+
+        // Add root source files
+        for (const rootSrc of rootSources) {
+            const fullPath = path.isAbsolute(rootSrc)
+                ? rootSrc
+                : path.join(workspaceRoot, rootSrc);
+
+            const info = getSourceFileInfo(fullPath, workspaceRoot, true);
+            if (info) {
+                sourceFiles.push(info);
+            }
+        }
+
+        // If no root sources found from build.zig, try to find root source
+        // from the common patterns: src/{artifact_name}.zig or src/main.zig
+        if (rootSources.length === 0) {
+            const possibleRoots = [
+                path.join(workspaceRoot, 'src', `${artifact.name}.zig`),
+                path.join(workspaceRoot, 'src', 'main.zig'),
+                path.join(workspaceRoot, 'src', 'root.zig'),
+                path.join(workspaceRoot, `${artifact.name}.zig`)
+            ];
+
+            for (const possibleRoot of possibleRoots) {
+                const info = getSourceFileInfo(possibleRoot, workspaceRoot, true);
+                if (info) {
+                    sourceFiles.push(info);
+                    break;
+                }
+            }
+        }
+
+        // Add other .zig files in src/ as "imported" source files
+        for (const srcFile of allSourceFiles) {
+            const isAlreadyAdded = sourceFiles.some(
+                sf => sf.absolutePath === srcFile
+            );
+            if (!isAlreadyAdded) {
+                const info = getSourceFileInfo(srcFile, workspaceRoot, false);
+                if (info) {
+                    sourceFiles.push(info);
+                }
+            }
+        }
+
+        // Get dependencies for this artifact
+        const deps = dependencyGraph.get(artifact.name) || [];
+
+        // Get file size if artifact exists
+        if (enriched.absolutePath) {
+            try {
+                const stats = fs.statSync(enriched.absolutePath);
+                enriched.fileSize = stats.size;
+            } catch {
+                // File doesn't exist yet
+            }
+        }
+
+        enriched.sourceFiles = sourceFiles;
+        enriched.dependencies = deps;
+
+        return enriched;
+    });
+
+    return {
+        summary,
+        artifacts: enrichedArtifacts,
+        artifactCompileSteps,
+        dependencyGraph
+    };
+}
+
+/**
+ * Build a dependency graph from the build step tree structure.
+ * Maps each artifact name to the list of artifacts it depends on.
+ */
+export function buildDependencyGraph(summary: BuildSummary): Map<string, ArtifactDependency[]> {
+    const graph = new Map<string, ArtifactDependency[]>();
+
+    // Find all compile steps and their dependency tree
+    for (const step of summary.allSteps) {
+        if (step.type !== 'compile_exe' && step.type !== 'compile_lib' && step.type !== 'compile_obj') {
+            continue;
+        }
+
+        const deps: ArtifactDependency[] = [];
+
+        // Walk children of the compile step to find dependencies
+        collectCompileDependencies(step, deps, step.name, summary.allSteps, new Set<string>());
+
+        // Also check if there's an install step that depends on this compile step,
+        // and then check siblings/ancestors for other compile steps
+        const parentDeps = findSiblingDependencies(step, summary);
+        for (const dep of parentDeps) {
+            if (!deps.some(d => d.name === dep.name)) {
+                deps.push(dep);
+            }
+        }
+
+        graph.set(step.name, deps);
+    }
+
+    return graph;
+}
+
+/**
+ * Recursively collect compile-step dependencies from the step tree
+ */
+function collectCompileDependencies(
+    step: BuildStep,
+    deps: ArtifactDependency[],
+    excludeName: string,
+    allSteps: BuildStep[],
+    visited: Set<string>
+): void {
+    if (visited.has(step.id)) {
+        return;
+    }
+    visited.add(step.id);
+
+    for (const child of step.children) {
+        if (child.type === 'compile_exe' || child.type === 'compile_lib' || child.type === 'compile_obj') {
+            if (child.name !== excludeName) {
+                deps.push({
+                    name: child.name,
+                    kind: child.type === 'compile_exe' ? 'exe' : child.type === 'compile_lib' ? 'lib' : 'obj',
+                    isTransitive: false,
+                    step: child
+                });
+            }
+        }
+        // Recurse into child's children for transitive dependencies
+        collectCompileDependencies(child, deps, excludeName, allSteps, visited);
+    }
+}
+
+/**
+ * Find dependencies from sibling compile steps within the same parent
+ */
+function findSiblingDependencies(
+    step: BuildStep,
+    summary: BuildSummary
+): ArtifactDependency[] {
+    const deps: ArtifactDependency[] = [];
+    const seen = new Set<string>();
+
+    // Look at the build tree to find artifacts that are installed or used
+    // by the same parent step
+    if (step.parent) {
+        for (const sibling of step.parent.children) {
+            if ((sibling.type === 'compile_exe' || sibling.type === 'compile_lib') &&
+                sibling.name !== step.name &&
+                !seen.has(sibling.name)) {
+                seen.add(sibling.name);
+                deps.push({
+                    name: sibling.name,
+                    kind: sibling.type === 'compile_exe' ? 'exe' : 'lib',
+                    isTransitive: true,
+                    step: sibling
+                });
+            }
+        }
+    }
+
+    return deps;
+}
+
+// ============================================================================
+// File Size Formatting
+// ============================================================================
+
+/**
+ * Format a file size in bytes to a human-readable string
+ */
+export function formatFileSize(bytes: number | undefined): string {
+    if (bytes === undefined) {
+        return '';
+    }
+
+    const units = ['B', 'KB', 'MB', 'GB'];
+    let value = bytes;
+    let unitIndex = 0;
+
+    while (value >= 1024 && unitIndex < units.length - 1) {
+        value /= 1024;
+        unitIndex++;
+    }
+
+    return `${value.toFixed(1)} ${units[unitIndex]}`;
+}
+
+/**
+ * Format duration in milliseconds to a human-readable string
+ */
+export function formatDuration(ms: number | undefined): string {
+    if (ms === undefined) {
+        return '';
+    }
+
+    if (ms < 1000) {
+        return `${ms}ms`;
+    }
+
+    const seconds = ms / 1000;
+    if (seconds < 60) {
+        return `${seconds.toFixed(1)}s`;
+    }
+
+    const minutes = Math.floor(seconds / 60);
+    const remainingSeconds = Math.round(seconds % 60);
+    return `${minutes}m ${remainingSeconds}s`;
+}

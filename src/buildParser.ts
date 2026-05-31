@@ -73,15 +73,44 @@ export function parseBuildSummary(output: string, workspaceRoot: string): BuildS
  * Parse a single line from the build summary
  */
 function parseLine(line: string, workspaceRoot: string): BuildStep | null {
-    // Calculate indentation level
-    const indentMatch = line.match(/^([\s|+]*)/);
-    if (!indentMatch) {
-        return null;
+    // Calculate indentation level.
+    // Zig 0.16 uses: "   +- " (3 spaces + "+- ") for child steps.
+    // Older Zig uses: "|  " or "+- " prefixes.
+    // The format looks like:
+    //   install cached                                    <- level 0, no indent
+    //   +- install zigtmp cached                          <- level 1, "+-" prefix
+    //      +- compile exe zigtmp Debug native cached ...   <- level 2, "   +-" prefix
+
+    let contentStart = 0;
+    let level = 0;
+
+    // Check for "+-" prefix first (indented or not)
+    // "   +- ..." -> spaces followed by "+-"
+    const indentMatch = line.match(/^(\s*)\+\-\s*/);
+    if (indentMatch) {
+        // Level is determined by leading spaces (each level = 3 spaces)
+        const spaces = indentMatch[1];
+        level = Math.max(1, Math.floor(spaces.length / 3) + 1);
+        contentStart = indentMatch[0].length;
+    } else {
+        // Check for other indent markers: "|  " style
+        const pipeMatch = line.match(/^([\s|]+)\-?\s*/);
+        if (pipeMatch && pipeMatch[1].includes('|')) {
+            level = Math.floor(pipeMatch[1].length / 3);
+            contentStart = pipeMatch[0].length;
+        } else {
+            // Level 0: no indent. Just consume the content as-is.
+            // But also check for plain spaces-based indent (older format)
+            const spaceMatch = line.match(/^(\s+)/);
+            if (spaceMatch) {
+                level = Math.floor(spaceMatch[1].length / 3);
+                contentStart = spaceMatch[0].length;
+            }
+            // else contentStart stays 0 (level 0)
+        }
     }
 
-    const indent = indentMatch[1];
-    const level = Math.floor(indent.length / 3);  // Each level is 3 chars: "|  " or "+- "
-    const content = line.slice(indent.length).trim();
+    const content = line.slice(contentStart).trim();
 
     if (!content) {
         return null;
@@ -265,16 +294,29 @@ function generateStepId(name: string, level: number): string {
  */
 export async function fetchBuildSummary(workspaceRoot: string): Promise<BuildSummary> {
     return new Promise((resolve, reject) => {
+        // Zig outputs build summary to stderr. We must merge both streams,
+        // but prefer stderr content since that's where the summary goes.
         cp.exec(
-            'zig build --summary all',
+            'zig build --summary all 2>&1',
             {
                 cwd: workspaceRoot,
                 timeout: 120000,  // 2 minutes timeout
                 maxBuffer: 1024 * 1024 * 50  // 50MB buffer
             },
             (error: cp.ExecException | null, stdout: string, stderr: string) => {
-                // Even if there's an error, we might have useful output
-                const output = stdout || stderr;
+                // With 2>&1, everything comes through stdout. Fallback to stderr.
+                let output = stdout || stderr || '';
+
+                // Filter out progress indicator lines (lines starting with [ or q or x)
+                // these are terminal control sequences that pollute the summary
+                const relevantLines: string[] = [];
+                for (const line of output.split('\n')) {
+                    if (line.startsWith('[') || line.startsWith('q ') || line.startsWith('x ') || line.startsWith('   q ') || line.startsWith('   x ')) {
+                        continue;
+                    }
+                    relevantLines.push(line);
+                }
+                output = relevantLines.join('\n');
 
                 if (!output) {
                     reject(error || new Error('No output from zig build'));
