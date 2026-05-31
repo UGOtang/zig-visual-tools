@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import * as cp from 'child_process';
 import * as path from 'path';
 import * as fs from 'fs';
-import type { BuildArtifact, BuildSummary, ArtifactSourceFile } from './types';
+import type { BuildArtifact, BuildSummary, ArtifactSourceFile, ArtifactDependency } from './types';
 import {
     fetchBuildSummary,
     artifactExists
@@ -119,14 +119,25 @@ export function activate(context: vscode.ExtensionContext) {
     );
 
     // Register open source file command
+    // This command can be triggered either:
+    // 1. From a TreeItem click (node is ArtifactTreeItem with sourceFile)
+    // 2. From context menu (node is ArtifactTreeItem with sourceFile)
+    // 3. From command arguments directly (src is ArtifactSourceFile)
     const openSourceFileDisposable = vscode.commands.registerCommand(
         'zig-visual-tools.openSourceFile',
-        (node: ArtifactTreeItem) => {
-            if (!node || !node.sourceFile) {
-                vscode.window.showWarningMessage('No source file selected.');
+        (arg?: ArtifactTreeItem | ArtifactSourceFile) => {
+            // If the argument is an ArtifactSourceFile directly (from item.command.arguments)
+            if (arg && typeof arg === 'object' && 'absolutePath' in arg && 'relativePath' in arg) {
+                openSourceFile(arg as ArtifactSourceFile);
                 return;
             }
-            openSourceFile(node.sourceFile);
+            // If the argument is an ArtifactTreeItem
+            const node = arg as ArtifactTreeItem | undefined;
+            if (node && node.sourceFile) {
+                openSourceFile(node.sourceFile);
+                return;
+            }
+            vscode.window.showWarningMessage('No source file selected.');
         }
     );
 
@@ -297,9 +308,25 @@ function openArtifactFolder(artifact: BuildArtifact) {
     vscode.commands.executeCommand('revealFileInOS', vscode.Uri.file(folderPath));
 }
 
-function openSourceFile(sourceFile: ArtifactSourceFile) {
-    const uri = vscode.Uri.file(sourceFile.absolutePath);
-    vscode.window.showTextDocument(uri);
+async function openSourceFile(sourceFile: ArtifactSourceFile) {
+    const filePath = sourceFile.absolutePath;
+
+    // Check if file exists
+    try {
+        await fs.promises.access(filePath, fs.constants.R_OK);
+    } catch {
+        vscode.window.showErrorMessage(`File not found: ${filePath}`);
+        return;
+    }
+
+    const uri = vscode.Uri.file(filePath);
+    try {
+        const doc = await vscode.workspace.openTextDocument(uri);
+        await vscode.window.showTextDocument(doc, { preview: true });
+    } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        vscode.window.showErrorMessage(`Cannot open file: ${message}`);
+    }
 }
 
 /**
@@ -829,7 +856,7 @@ class BuildArtifactsProvider implements vscode.TreeDataProvider<ArtifactTreeItem
     private getArtifactChildren(artifact: BuildArtifact): ArtifactTreeItem[] {
         const children: ArtifactTreeItem[] = [];
 
-        // Source files section
+        // Source files section - group by directory
         const sourceFiles = artifact.sourceFiles || [];
         if (sourceFiles.length > 0) {
             // Count files by language
@@ -862,65 +889,60 @@ class BuildArtifactsProvider implements vscode.TreeDataProvider<ArtifactTreeItem
             );
             srcFolder.description = parts.join(', ');
 
-            srcFolder.children = sourceFiles.map(src => {
-                const rootMarker = src.isRootSource ? ' [root]' : '';
-
-                // Determine icon based on language
-                let icon: vscode.ThemeIcon;
-                switch (src.language) {
-                    case 'c':
-                        icon = new vscode.ThemeIcon('file-code', new vscode.ThemeColor('debugIcon.breakpointForeground'));
-                        break;
-                    case 'cpp':
-                        icon = new vscode.ThemeIcon('file-code', new vscode.ThemeColor('symbolIcon.classForeground'));
-                        break;
-                    case 'header':
-                        icon = new vscode.ThemeIcon('file-code', new vscode.ThemeColor('symbolIcon.interfaceForeground'));
-                        break;
-                    case 'zig':
-                    default:
-                        icon = new vscode.ThemeIcon(src.isRootSource ? 'file-code' : 'file');
-                        break;
+            // Group source files by directory
+            const filesByDir = new Map<string, ArtifactSourceFile[]>();
+            for (const src of sourceFiles) {
+                const dir = path.dirname(src.relativePath);
+                if (!filesByDir.has(dir)) {
+                    filesByDir.set(dir, []);
                 }
+                filesByDir.get(dir)!.push(src);
+            }
 
-                const item = new ArtifactTreeItem(
-                    `src-${src.relativePath}`,
-                    src.name,
-                    vscode.TreeItemCollapsibleState.None,
-                    'source-file',
-                    icon,
-                    undefined,
-                    src
-                );
-
-                // Show language and line count in description
-                const langLabel = src.language === 'zig' ? 'Zig' :
-                                 src.language === 'c' ? 'C' :
-                                 src.language === 'cpp' ? 'C++' :
-                                 src.language === 'header' ? 'Header' :
-                                 src.language === 'objc' ? 'Obj-C' : 'Unknown';
-                item.description = `${langLabel}, ${src.lineCount} lines${rootMarker}`;
-
-                // Build tooltip with more details
-                const tooltipLines = [
-                    `${src.name}`,
-                    `Path: ${src.relativePath}`,
-                    `Language: ${langLabel}`,
-                    `Lines: ${src.lineCount}`
-                ];
-                if (src.isRootSource) {
-                    tooltipLines.push('Type: Root source file');
-                }
-                item.tooltip = tooltipLines.join('\n');
-
-                item.command = {
-                    command: 'zig-visual-tools.openSourceFile',
-                    title: 'Open Source File',
-                    arguments: [item]
-                };
-                return item;
+            // Sort directories (root first, then alphabetically)
+            const sortedDirs = Array.from(filesByDir.keys()).sort((a, b) => {
+                if (a === '.') { return -1; }
+                if (b === '.') { return 1; }
+                return a.localeCompare(b);
             });
 
+            // Create folder structure
+            const folderItems: ArtifactTreeItem[] = [];
+
+            for (const dir of sortedDirs) {
+                const files = filesByDir.get(dir)!;
+                // Sort files: root source first, then by name
+                files.sort((a, b) => {
+                    if (a.isRootSource && !b.isRootSource) { return -1; }
+                    if (!a.isRootSource && b.isRootSource) { return 1; }
+                    return a.name.localeCompare(b.name);
+                });
+
+                if (dir === '.') {
+                    // Root level files - add directly
+                    for (const src of files) {
+                        folderItems.push(this.createSourceFileItem(src, artifact.name));
+                    }
+                } else {
+                    // Create folder node
+                    const dirName = dir.split('/').pop() || dir;
+                    const folderItem = new ArtifactTreeItem(
+                        `folder-${artifact.name}-${dir}`,
+                        dirName,
+                        vscode.TreeItemCollapsibleState.Collapsed,
+                        'source-directory',
+                        new vscode.ThemeIcon('folder')
+                    );
+                    folderItem.description = `${files.length} files`;
+                    folderItem.tooltip = `Directory: ${dir}`;
+
+                    // Add files as children
+                    folderItem.children = files.map(src => this.createSourceFileItem(src, artifact.name));
+                    folderItems.push(folderItem);
+                }
+            }
+
+            srcFolder.children = folderItems;
             children.push(srcFolder);
         } else {
             const noSrc = new ArtifactTreeItem(
@@ -936,6 +958,11 @@ class BuildArtifactsProvider implements vscode.TreeDataProvider<ArtifactTreeItem
         // Dependencies section
         const deps = artifact.dependencies || [];
         if (deps.length > 0) {
+            // Group dependencies by kind for better organization
+            const exeDeps = deps.filter(d => d.kind === 'exe');
+            const libDeps = deps.filter(d => d.kind === 'lib');
+            const objDeps = deps.filter(d => d.kind === 'obj');
+
             const depFolder = new ArtifactTreeItem(
                 `deps-${artifact.name}`,
                 `Dependencies (${deps.length})`,
@@ -944,20 +971,62 @@ class BuildArtifactsProvider implements vscode.TreeDataProvider<ArtifactTreeItem
                 new vscode.ThemeIcon('references')
             );
 
-            depFolder.children = deps.map(dep => {
-                const transitive = dep.isTransitive ? ' [transitive]' : '';
-                const depItem = new ArtifactTreeItem(
-                    `dep-${dep.name}`,
-                    dep.name,
-                    vscode.TreeItemCollapsibleState.None,
-                    'dependency',
-                    new vscode.ThemeIcon(dep.kind === 'exe' ? 'play' : 'library')
-                );
-                depItem.description = `${dep.kind}${transitive}`;
-                depItem.tooltip = `${dep.name}\nKind: ${dep.kind}\nType: ${dep.isTransitive ? 'Transitive' : 'Direct'}`;
-                return depItem;
-            });
+            // Build description showing breakdown
+            const depParts: string[] = [];
+            if (exeDeps.length > 0) {
+                depParts.push(`${exeDeps.length} exe`);
+            }
+            if (libDeps.length > 0) {
+                depParts.push(`${libDeps.length} lib`);
+            }
+            if (objDeps.length > 0) {
+                depParts.push(`${objDeps.length} obj`);
+            }
+            depFolder.description = depParts.join(', ');
 
+            // Create dependency items grouped by kind
+            const depItems: ArtifactTreeItem[] = [];
+
+            // Add executables group
+            if (exeDeps.length > 0) {
+                const exeFolder = new ArtifactTreeItem(
+                    `deps-exe-${artifact.name}`,
+                    `Executables (${exeDeps.length})`,
+                    vscode.TreeItemCollapsibleState.Collapsed,
+                    'dependency-group',
+                    new vscode.ThemeIcon('play')
+                );
+                exeFolder.children = exeDeps.map(dep => this.createDependencyItem(dep, artifact.name));
+                depItems.push(exeFolder);
+            }
+
+            // Add libraries group
+            if (libDeps.length > 0) {
+                const libFolder = new ArtifactTreeItem(
+                    `deps-lib-${artifact.name}`,
+                    `Libraries (${libDeps.length})`,
+                    vscode.TreeItemCollapsibleState.Collapsed,
+                    'dependency-group',
+                    new vscode.ThemeIcon('library')
+                );
+                libFolder.children = libDeps.map(dep => this.createDependencyItem(dep, artifact.name));
+                depItems.push(libFolder);
+            }
+
+            // Add object files group
+            if (objDeps.length > 0) {
+                const objFolder = new ArtifactTreeItem(
+                    `deps-obj-${artifact.name}`,
+                    `Object Files (${objDeps.length})`,
+                    vscode.TreeItemCollapsibleState.Collapsed,
+                    'dependency-group',
+                    new vscode.ThemeIcon('file-binary')
+                );
+                objFolder.children = objDeps.map(dep => this.createDependencyItem(dep, artifact.name));
+                depItems.push(objFolder);
+            }
+
+            depFolder.children = depItems;
             children.push(depFolder);
         }
 
@@ -1122,6 +1191,133 @@ class BuildArtifactsProvider implements vscode.TreeDataProvider<ArtifactTreeItem
         tooltipLines.push(`Dependencies: ${artifact.dependencies?.length || 0}`);
 
         item.tooltip = tooltipLines.join('\n');
+
+        return item;
+    }
+
+    /**
+     * Create a tree item for a source file
+     */
+    private createSourceFileItem(src: ArtifactSourceFile, artifactName: string): ArtifactTreeItem {
+        const rootMarker = src.isRootSource ? ' [root]' : '';
+
+        // Determine icon based on language
+        let icon: vscode.ThemeIcon;
+        switch (src.language) {
+            case 'c':
+                icon = new vscode.ThemeIcon('file-code', new vscode.ThemeColor('debugIcon.breakpointForeground'));
+                break;
+            case 'cpp':
+                icon = new vscode.ThemeIcon('file-code', new vscode.ThemeColor('symbolIcon.classForeground'));
+                break;
+            case 'header':
+                icon = new vscode.ThemeIcon('file-code', new vscode.ThemeColor('symbolIcon.interfaceForeground'));
+                break;
+            case 'zig':
+            default:
+                icon = new vscode.ThemeIcon(src.isRootSource ? 'file-code' : 'file');
+                break;
+        }
+
+        const item = new ArtifactTreeItem(
+            `src-${artifactName}-${src.relativePath}`,
+            src.name,
+            vscode.TreeItemCollapsibleState.None,
+            'file',  // contextValue must match package.json menu: viewItem == file
+            icon,
+            undefined,
+            src
+        );
+
+        // Show language and line count in description
+        const langLabel = src.language === 'zig' ? 'Zig' :
+                         src.language === 'c' ? 'C' :
+                         src.language === 'cpp' ? 'C++' :
+                         src.language === 'header' ? 'Header' :
+                         src.language === 'objc' ? 'Obj-C' : 'Unknown';
+        item.description = `${langLabel}, ${src.lineCount} lines${rootMarker}`;
+
+        // Build tooltip with more details
+        const tooltipLines = [
+            `${src.name}`,
+            `Path: ${src.relativePath}`,
+            `Language: ${langLabel}`,
+            `Lines: ${src.lineCount}`
+        ];
+        if (src.isRootSource) {
+            tooltipLines.push('Type: Root source file');
+        }
+        item.tooltip = tooltipLines.join('\n');
+
+        item.command = {
+            command: 'zig-visual-tools.openSourceFile',
+            title: 'Open Source File',
+            arguments: [src]  // Pass ArtifactSourceFile directly
+        };
+
+        return item;
+    }
+
+    /**
+     * Create a tree item for a dependency
+     */
+    private createDependencyItem(dep: ArtifactDependency, parentArtifactName: string): ArtifactTreeItem {
+        const transitive = dep.isTransitive ? ' [transitive]' : '';
+
+        // Determine icon based on dependency kind
+        let icon: vscode.ThemeIcon;
+        switch (dep.kind) {
+            case 'exe':
+                icon = new vscode.ThemeIcon('play');
+                break;
+            case 'lib':
+                icon = new vscode.ThemeIcon('library');
+                break;
+            case 'obj':
+                icon = new vscode.ThemeIcon('file-binary');
+                break;
+            default:
+                icon = new vscode.ThemeIcon('package');
+        }
+
+        const item = new ArtifactTreeItem(
+            `dep-${parentArtifactName}-${dep.name}`,
+            dep.name,
+            vscode.TreeItemCollapsibleState.None,
+            'dependency',
+            icon
+        );
+
+        // Build description
+        const typeLabel = dep.isTransitive ? 'transitive' : 'direct';
+        item.description = `${dep.kind}, ${typeLabel}`;
+
+        // Build tooltip with detailed info
+        const tooltipLines = [
+            `${dep.name}`,
+            `Kind: ${dep.kind === 'exe' ? 'Executable' : dep.kind === 'lib' ? 'Library' : 'Object File'}`,
+            `Type: ${dep.isTransitive ? 'Transitive dependency' : 'Direct dependency'}`
+        ];
+
+        // Add build step info if available
+        if (dep.step) {
+            tooltipLines.push(`Step: ${dep.step.name}`);
+            if (dep.step.status) {
+                tooltipLines.push(`Status: ${dep.step.status}`);
+            }
+            if (dep.step.duration) {
+                tooltipLines.push(`Duration: ${formatDuration(dep.step.duration)}`);
+            }
+        }
+
+        item.tooltip = tooltipLines.join('\n');
+
+        // Add command to show dependency details or navigate to it
+        item.command = {
+            command: 'zig-visual-tools.showArtifactDependencies',
+            title: 'Show Dependency Info',
+            arguments: [dep]
+        };
 
         return item;
     }

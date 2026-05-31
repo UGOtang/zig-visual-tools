@@ -133,6 +133,11 @@
           "command": "zig-visual-tools.showArtifactDependencies",
           "when": "viewItem =~ /zigArtifact/",
           "group": "inline@5"
+        },
+        {
+          "command": "zig-visual-tools.openSourceFile",
+          "when": "viewItem == file",
+          "group": "inline"
         }
       ]
     }

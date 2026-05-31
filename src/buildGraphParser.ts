@@ -2,10 +2,9 @@
  * Parser for extracting source file dependencies and build graph from
  * build.zig and `zig build --summary all` output.
  *
- * Inspired by CMake's visual target dependency graph, this module provides:
- * - Source file extraction for each artifact
- * - Dependency relationships between artifacts
- * - Artifact-to-source-file mapping
+ * Supports both:
+ * - Modern Zig 0.16+ syntax: b.createModule() + b.addLibrary/.addExecutable(.{ .root_module = mod })
+ * - Legacy syntax: b.addExecutable(.{ .root_source_file = ... })
  */
 
 import * as path from 'path';
@@ -20,238 +19,339 @@ import type {
 } from './types';
 
 // ============================================================================
-// build.zig Parser: Extract root source files for each artifact
+// build.zig Parser: Extract source files for each artifact
 // ============================================================================
 
 /**
- * Parse build.zig to find root source files associated with each artifact.
- * This scans for patterns like:
- *   b.addExecutable(.{ .name = "myexe", .root_module = ... })
- *   b.addStaticLibrary(.{ .name = "mylib", .root_module = ... })
- *   b.addSharedLibrary(.{ .name = "mylib", .root_module = ... })
- *   b.addObject(.{ .name = "myobj", .root_module = ... })
- *
- * Supports both modern Zig (0.12+) syntax with b.path() and older syntax.
+ * Represents an artifact's source files extracted from build.zig
  */
-export function parseBuildZig(workspaceRoot: string): Map<string, string[]> {
-    const artifactSources = new Map<string, string[]>();
+interface ArtifactSourceInfo {
+    /** Artifact name from .name = "..." or addLibrary/addExecutable */
+    name: string;
+    /** Root source file (Zig) if any */
+    rootSourceFile: string | null;
+    /** C/C++ source files from addCSourceFiles */
+    cSourceFiles: string[];
+    /** Whether this is a test artifact */
+    isTest: boolean;
+    /** Kind of artifact */
+    kind: 'exe' | 'lib' | 'obj';
+    /** Whether library is dynamic/shared */
+    isDynamic: boolean;
+    /** Module variable name (e.g., "leveldb_mod") for tracking addCSourceFiles */
+    moduleName: string | null;
+}
+
+/**
+ * Parse build.zig to find source files associated with each artifact.
+ *
+ * Strategy:
+ * 1. Find all `b.createModule(...)` calls and record their variable names
+ * 2. Find all `b.addLibrary/addExecutable/addTest/addObject(...)` calls and
+ *    extract .name, .root_module variable, .linkage
+ * 3. For each module, find `mod.addCSourceFiles(...)` calls with their file lists
+ * 4. For each module, find `.root_source_file = ...`
+ * 5. Map modules back to artifacts via .root_module reference
+ */
+export function parseBuildZig(workspaceRoot: string): Map<string, ArtifactSourceInfo> {
+    const result = new Map<string, ArtifactSourceInfo>();
     const buildZigPath = path.join(workspaceRoot, 'build.zig');
 
     try {
         const content = fs.readFileSync(buildZigPath, 'utf8');
-        const lines = content.split('\n');
 
-        // Find all addExecutable / addStaticLibrary / addSharedLibrary / addObject / addTest declarations
-        // and their root source files
-        let currentArtifact: string | null = null;
-        let braceDepth = 0;
-        let inArtifactBlock = false;
+        // Step 1: Find all module variable declarations: const xxx_mod = b.createModule(...)
+        const moduleMap = new Map<string, ArtifactSourceInfo>();
+        const moduleRegex = /const\s+(\w+)\s*=\s*b\.createModule\s*\(/g;
+        let moduleMatch;
+        while ((moduleMatch = moduleRegex.exec(content)) !== null) {
+            const varName = moduleMatch[1];
+            // Extract the block following createModule
+            const blockStart = moduleMatch.index;
+            const blockText = extractBlockTextFromContent(content, blockStart);
 
-        for (let i = 0; i < lines.length; i++) {
-            const line = lines[i];
-
-            // Match modern Zig 0.12+ syntax:
-            //   b.addExecutable(.{ .name = "artifact_name", ... })
-            //   b.addStaticLibrary(.{ .name = "artifact_name", ... })
-            //   b.addSharedLibrary(.{ .name = "artifact_name", ... })
-            //   b.addObject(.{ .name = "artifact_name", ... })
-            //   b.addTest(.{ .name = "artifact_name", ... })
-            // Also support older syntax:
-            //   b.addExecutable("name", "src/main.zig")
-            const modernMatch = line.match(/\.add(Executable|StaticLibrary|SharedLibrary|Object|Test)\s*\(/);
-            const legacyMatch = line.match(/\.add(Executable|Library|Test|Object)\s*\(/);
-            const addMatch = modernMatch || legacyMatch;
-
-            if (addMatch) {
-                // Check if this is modern syntax (.{ ... }) or legacy syntax
-                const isModern = line.includes('.{') || (i + 1 < lines.length && lines[i + 1].includes('.{'));
-
-                if (isModern) {
-                    // Look for .name = "..." in the next few lines or same line
-                    const blockText = extractBlockText(lines, i);
-                    const nameMatch = blockText.match(/\.name\s*=\s*"([^"]+)"/);
-                    if (nameMatch) {
-                        currentArtifact = nameMatch[1];
-                        if (!artifactSources.has(currentArtifact)) {
-                            artifactSources.set(currentArtifact, []);
-                        }
-                        inArtifactBlock = true;
-                        braceDepth = 0;
-                    }
-                } else {
-                    // Legacy syntax: b.addExecutable("name", "src/main.zig")
-                    const legacyNameMatch = line.match(/\(\s*"([^"]+)"\s*,/);
-                    const legacySrcMatch = line.match(/,\s*"([^"]+)"\s*\)/);
-
-                    if (legacyNameMatch) {
-                        currentArtifact = legacyNameMatch[1];
-                        if (!artifactSources.has(currentArtifact)) {
-                            artifactSources.set(currentArtifact, []);
-                        }
-
-                        // Legacy syntax often has the source file inline
-                        if (legacySrcMatch) {
-                            const srcPath = legacySrcMatch[1];
-                            const sources = artifactSources.get(currentArtifact);
-                            if (sources && !sources.includes(srcPath)) {
-                                sources.push(srcPath);
-                            }
-                        }
-                    }
-                }
-                continue;
+            // Find root_source_file in the module block
+            let rootSourceFile: string | null = null;
+            const rootSrcMatch = blockText.match(/\.root_source_file\s*=\s*(?:b\.path\s*\(\s*"([^"]+)"\s*\)|"([^"]+)")/);
+            if (rootSrcMatch) {
+                rootSourceFile = rootSrcMatch[1] || rootSrcMatch[2] || null;
             }
 
-            // Track brace depth to know when we exit the artifact configuration block
-            if (inArtifactBlock) {
-                for (const ch of line) {
-                    if (ch === '{') {
-                        braceDepth++;
-                    }
-                    if (ch === '}') {
-                        braceDepth--;
-                    }
-                }
+            const info: ArtifactSourceInfo = {
+                name: varName,
+                rootSourceFile,
+                cSourceFiles: [],
+                isTest: false,
+                kind: 'lib', // default, will be updated when linked
+                isDynamic: false,
+                moduleName: varName
+            };
+            moduleMap.set(varName, info);
+        }
 
-                if (braceDepth <= 0 && line.includes('})')) {
-                    inArtifactBlock = false;
-                    currentArtifact = null;
-                    continue;
-                }
+        // Step 2: Find addCSourceFiles calls on module variables
+        // Pattern: mod_name.addCSourceFiles(.{ .root = ..., .files = &.{...} })
+        for (const [varName, info] of moduleMap) {
+            // Find all addCSourceFiles calls for this module variable
+            const cSrcRegex = new RegExp(
+                `${escapeRegex(varName)}\\.addCSourceFiles\\s*\\(`,
+                'g'
+            );
+            let cSrcMatch;
+            while ((cSrcMatch = cSrcRegex.exec(content)) !== null) {
+                const blockText = extractBlockTextFromContent(content, cSrcMatch.index);
+                const files = extractCSourceFilesFromBlock(blockText);
+                info.cSourceFiles.push(...files);
             }
 
-            // Match: .root_source_file = b.path("src/main.zig") - modern Zig 0.12+
-            if (currentArtifact && line.includes('.root_source_file')) {
-                // Try modern b.path() syntax first
-                const modernSrcMatch = line.match(/\.root_source_file\s*=\s*(?:b\.path\s*\(\s*"([^"]+)"\s*\)|\.\{\s*\.path\s*=\s*"([^"]+)"\s*\})/);
-                if (modernSrcMatch) {
-                    const srcPath = modernSrcMatch[1] || modernSrcMatch[2];
-                    if (srcPath) {
-                        const sources = artifactSources.get(currentArtifact);
-                        if (sources && !sources.includes(srcPath)) {
-                            sources.push(srcPath);
-                        }
-                    }
-                } else {
-                    // Try legacy .root_source_file = "src/main.zig" syntax
-                    const legacySrcMatch = line.match(/\.root_source_file\s*=\s*"([^"]+)"/);
-                    if (legacySrcMatch) {
-                        const srcPath = legacySrcMatch[1];
-                        const sources = artifactSources.get(currentArtifact);
-                        if (sources && !sources.includes(srcPath)) {
-                            sources.push(srcPath);
-                        }
-                    }
-                }
-            }
-
-            // Match: .root_module = b.createModule(.{ .root_source_file = ... }) - new module syntax
-            if (currentArtifact && line.includes('.root_module')) {
-                // Extract the module block and look for root_source_file within
-                const moduleBlock = extractBlockText(lines, i);
-                const srcMatch = moduleBlock.match(/\.root_source_file\s*=\s*(?:b\.path\s*\(\s*"([^"]+)"\s*\)|"([^"]+)")/);
-                if (srcMatch) {
-                    const srcPath = srcMatch[1] || srcMatch[2];
-                    if (srcPath) {
-                        const sources = artifactSources.get(currentArtifact);
-                        if (sources && !sources.includes(srcPath)) {
-                            sources.push(srcPath);
-                        }
-                    }
-                }
-            }
-
-            // Match: mod.addCSourceFile() and mod.addCSourceFiles() - C/C++ source files
-            // This can be on a module or directly on the artifact
-            if (currentArtifact && (line.includes('.addCSourceFile') || line.includes('.addCSourceFiles'))) {
-                // Try to extract file paths from addCSourceFile or addCSourceFiles calls
-                // Patterns:
-                //   mod.addCSourceFile(b.path("src/foo.c"), &.{"-std=c99"});
-                //   mod.addCSourceFile(.{ .file = b.path("src/foo.c"), .flags = &.{"-std=c99"} });
-                //   mod.addCSourceFiles(&.{"src/foo.c", "src/bar.c"}, &.{"-std=c99"});
-
-                // Single file: addCSourceFile(b.path("..."))
-                const singleFileMatch = line.match(/addCSourceFile\s*\(\s*(?:b\.path\s*\(\s*"([^"]+)"|\.\{\s*\.file\s*=\s*(?:b\.path\s*\(\s*"([^"]+)")|\s*"([^"]+)")/);
-                if (singleFileMatch) {
-                    const srcPath = singleFileMatch[1] || singleFileMatch[2] || singleFileMatch[3];
-                    if (srcPath) {
-                        const sources = artifactSources.get(currentArtifact);
-                        if (sources && !sources.includes(srcPath)) {
-                            sources.push(srcPath);
-                        }
-                    }
-                }
-
-                // Multiple files: addCSourceFiles(&.{"file1.c", "file2.c"})
-                const multiFileMatch = line.match(/addCSourceFiles\s*\(\s*&\.\{\s*([^}]+)\}/);
-                if (multiFileMatch) {
-                    const filesList = multiFileMatch[1];
-                    // Extract all quoted strings from the list
-                    const fileMatches = filesList.matchAll(/"([^"]+\.c)"/g);
-                    const sources = artifactSources.get(currentArtifact);
-                    if (sources) {
-                        for (const match of fileMatches) {
-                            const srcPath = match[1];
-                            if (!sources.includes(srcPath)) {
-                                sources.push(srcPath);
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Match: mod.linkLibrary() - for C library dependencies
-            if (currentArtifact && line.includes('.linkLibrary')) {
-                // This indicates a dependency on a C library
-                // The library name might be useful for dependency tracking
-                const libMatch = line.match(/\.linkLibrary\s*\(\s*(\w+)\s*\)/);
-                if (libMatch) {
-                    // Could track external C library dependencies here
-                    // libMatch[1] is the variable name of the library
-                }
-            }
-
-            // Match: @cImport/@cInclude references in the source file detection
-            // These are detected at runtime via source file analysis, not in build.zig parsing
-
-            // Reset current artifact when we see certain patterns indicating end of block
-            if (currentArtifact && !inArtifactBlock) {
-                if (line.match(/^\s*\)\s*;?/) ||
-                    line.match(/^\s*\}\s*;?/) ||
-                    (line.match(/^\s*const\s/) && !line.includes('='))) {
-                    currentArtifact = null;
-                }
+            // Also check for addCSourceFile (singular)
+            const cSrcSingleRegex = new RegExp(
+                `${escapeRegex(varName)}\\.addCSourceFile\\s*\\(`,
+                'g'
+            );
+            let cSrcSingleMatch;
+            while ((cSrcSingleMatch = cSrcSingleRegex.exec(content)) !== null) {
+                const blockText = extractBlockTextFromContent(content, cSrcSingleMatch.index);
+                const files = extractCSourceFilesFromBlock(blockText);
+                info.cSourceFiles.push(...files);
             }
         }
 
-        return artifactSources;
-    } catch (err) {
-        // If build.zig can't be read, return empty map
-        return artifactSources;
+        // Step 3: Find all addLibrary/addExecutable/addTest calls
+        // Pattern: b.addLibrary(.{ .name = "xxx", .root_module = var_name })
+        // Pattern: b.addExecutable(.{ .name = "xxx", .root_module = var_name })
+        const artifactRegex = /b\.add(Executable|Library|Test|Object)\s*\(/g;
+        let artifactMatch;
+        while ((artifactMatch = artifactRegex.exec(content)) !== null) {
+            const kindStr = artifactMatch[1];
+            const blockText = extractBlockTextFromContent(content, artifactMatch.index);
+
+            // Extract name
+            const nameMatch = blockText.match(/\.name\s*=\s*"([^"]+)"/);
+            if (!nameMatch) {
+                continue;
+            }
+            const artifactName = nameMatch[1];
+
+            // Extract root_module reference
+            const rootModuleMatch = blockText.match(/\.root_module\s*=\s*(\w+)/);
+
+            // Extract linkage
+            const linkageMatch = blockText.match(/\.linkage\s*=\s*\.(\w+)/);
+            const isDynamic = linkageMatch?.[1] === 'dynamic';
+
+            // Determine kind
+            let kind: 'exe' | 'lib' | 'obj' = 'lib';
+            if (kindStr === 'Executable') {
+                kind = 'exe';
+            } else if (kindStr === 'Object') {
+                kind = 'obj';
+            }
+
+            // Check for test
+            const isTest = kindStr === 'Test';
+
+            // Check for root_source_file directly in the artifact block (non-module syntax)
+            let rootSourceFile: string | null = null;
+            const rootSrcMatch = blockText.match(/\.root_source_file\s*=\s*(?:b\.path\s*\(\s*"([^"]+)"\s*\)|"([^"]+)")/);
+            if (rootSrcMatch) {
+                rootSourceFile = rootSrcMatch[1] || rootSrcMatch[2] || null;
+            }
+
+            // Build the artifact info
+            const info: ArtifactSourceInfo = {
+                name: artifactName,
+                rootSourceFile,
+                cSourceFiles: [],
+                isTest,
+                kind,
+                isDynamic,
+                moduleName: null
+            };
+
+            // If there's a root_module reference, merge the module's source files
+            if (rootModuleMatch) {
+                const moduleVarName = rootModuleMatch[1];
+                info.moduleName = moduleVarName;
+                const moduleInfo = moduleMap.get(moduleVarName);
+                if (moduleInfo) {
+                    info.cSourceFiles = [...moduleInfo.cSourceFiles];
+                    if (!info.rootSourceFile && moduleInfo.rootSourceFile) {
+                        info.rootSourceFile = moduleInfo.rootSourceFile;
+                    }
+                }
+            }
+
+            // Also look for addCSourceFiles directly on the artifact variable
+            // This handles patterns like:
+            //   const exe = b.addExecutable(.{...});
+            //   exe.addCSourceFiles(.{...});
+            // We need to find the variable name first
+            const varDeclMatch = content.substring(0, artifactMatch.index).match(/const\s+(\w+)\s*=\s*$/m);
+            if (varDeclMatch) {
+                const artifactVarName = varDeclMatch[1];
+                const cSrcRegex = new RegExp(
+                    `${escapeRegex(artifactVarName)}\\.addCSourceFiles\\s*\\(`,
+                    'g'
+                );
+                let cSrcMatchInner;
+                while ((cSrcMatchInner = cSrcRegex.exec(content)) !== null) {
+                    const innerBlockText = extractBlockTextFromContent(content, cSrcMatchInner.index);
+                    const files = extractCSourceFilesFromBlock(innerBlockText);
+                    info.cSourceFiles.push(...files);
+                }
+            }
+
+            result.set(artifactName, info);
+        }
+
+        // Step 4: Also find artifacts declared with legacy syntax
+        // Pattern: const xxx = b.addStaticLibrary(.{ .name = "xxx", ... })
+        // or: const xxx = b.addSharedLibrary(.{ .name = "xxx", ... })
+        const legacyArtifactRegex = /b\.add(StaticLibrary|SharedLibrary)\s*\(/g;
+        let legacyMatch;
+        while ((legacyMatch = legacyArtifactRegex.exec(content)) !== null) {
+            const kindStr = legacyMatch[1];
+            const blockText = extractBlockTextFromContent(content, legacyMatch.index);
+
+            const nameMatch = blockText.match(/\.name\s*=\s*"([^"]+)"/);
+            if (!nameMatch) {
+                continue;
+            }
+            const artifactName = nameMatch[1];
+
+            // Skip if already found
+            if (result.has(artifactName)) {
+                continue;
+            }
+
+            const isDynamic = kindStr === 'SharedLibrary';
+
+            const info: ArtifactSourceInfo = {
+                name: artifactName,
+                rootSourceFile: null,
+                cSourceFiles: [],
+                isTest: false,
+                kind: 'lib',
+                isDynamic,
+                moduleName: null
+            };
+
+            // Check for root_module reference
+            const rootModuleMatch = blockText.match(/\.root_module\s*=\s*(\w+)/);
+            if (rootModuleMatch) {
+                const moduleVarName = rootModuleMatch[1];
+                info.moduleName = moduleVarName;
+                const moduleInfo = moduleMap.get(moduleVarName);
+                if (moduleInfo) {
+                    info.cSourceFiles = [...moduleInfo.cSourceFiles];
+                    if (moduleInfo.rootSourceFile) {
+                        info.rootSourceFile = moduleInfo.rootSourceFile;
+                    }
+                }
+            }
+
+            // Check for root_source_file directly
+            const rootSrcMatch = blockText.match(/\.root_source_file\s*=\s*(?:b\.path\s*\(\s*"([^"]+)"\s*\)|"([^"]+)")/);
+            if (rootSrcMatch) {
+                info.rootSourceFile = rootSrcMatch[1] || rootSrcMatch[2] || null;
+            }
+
+            result.set(artifactName, info);
+        }
+
+        return result;
+    } catch {
+        return result;
     }
 }
 
 /**
- * Extract multi-line block text starting from the given line
+ * Extract C source file paths from a block of text (addCSourceFiles call)
  */
-function extractBlockText(lines: string[], startIndex: number): string {
+function extractCSourceFilesFromBlock(blockText: string): string[] {
+    const files: string[] = [];
+
+    // Pattern: .files = &.{ "file1", "file2", ... }
+    const filesListMatch = blockText.match(/\.files\s*=\s*&\.\{([^}]+)\}/s);
+    if (filesListMatch) {
+        const filesList = filesListMatch[1];
+        const fileMatches = filesList.matchAll(/"([^"]+)"/g);
+        for (const match of fileMatches) {
+            const filePath = match[1];
+            // Only include actual source files (not flags)
+            if (isSourceFilePath(filePath)) {
+                files.push(filePath);
+            }
+        }
+    }
+
+    // Legacy pattern: addCSourceFiles(&.{ "file1", "file2" }, &.{})
+    if (files.length === 0) {
+        const legacyMatch = blockText.match(/addCSourceFiles\s*\(\s*&\.\{([^}]+)\}/s);
+        if (legacyMatch) {
+            const filesList = legacyMatch[1];
+            const fileMatches = filesList.matchAll(/"([^"]+)"/g);
+            for (const match of fileMatches) {
+                const filePath = match[1];
+                if (isSourceFilePath(filePath)) {
+                    files.push(filePath);
+                }
+            }
+        }
+    }
+
+    // Single file pattern: addCSourceFile(b.path("file"))
+    if (files.length === 0) {
+        const singleMatch = blockText.match(/addCSourceFile\s*\(\s*(?:b\.path\s*\(\s*"([^"]+)"\s*\)|"([^"]+)")/);
+        if (singleMatch) {
+            const filePath = singleMatch[1] || singleMatch[2];
+            if (filePath && isSourceFilePath(filePath)) {
+                files.push(filePath);
+            }
+        }
+    }
+
+    return files;
+}
+
+/**
+ * Check if a path looks like a source file (not a flag or directory)
+ */
+function isSourceFilePath(p: string): boolean {
+    // Must contain a file extension
+    const ext = path.extname(p);
+    if (!ext) {
+        return false;
+    }
+    // Must be a known source file extension
+    const sourceExts = ['.zig', '.c', '.cpp', '.cc', '.cxx', '.h', '.hpp', '.hxx', '.m', '.mm', '.rc'];
+    return sourceExts.includes(ext.toLowerCase());
+}
+
+/**
+ * Extract block text from content starting at a given index.
+ * Handles nested braces and parentheses.
+ */
+function extractBlockTextFromContent(content: string, startIndex: number): string {
     let depth = 0;
     let block = '';
     let inBlock = false;
 
-    for (let i = startIndex; i < Math.min(startIndex + 50, lines.length); i++) {
-        const line = lines[i];
+    for (let i = startIndex; i < Math.min(startIndex + 5000, content.length); i++) {
+        const ch = content[i];
 
-        for (const ch of line) {
+        if (ch === '(' || ch === '.') {
+            // Don't count . as depth, but ( does
             if (ch === '(') {
                 depth++;
                 inBlock = true;
-            } else if (ch === ')') {
-                depth--;
             }
+        } else if (ch === ')') {
+            depth--;
         }
 
-        block += line + '\n';
+        block += ch;
 
         if (inBlock && depth === 0) {
             break;
@@ -261,111 +361,18 @@ function extractBlockText(lines: string[], startIndex: number): string {
     return block;
 }
 
+/**
+ * Escape special regex characters in a string
+ */
+function escapeRegex(str: string): string {
+    return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 // ============================================================================
-// Source File Discovery
+// Source File Info Builder
 // ============================================================================
 
-/**
- * Supported source file extensions for Zig projects.
- * Zig projects often mix Zig with C/C++ code via @cImport, @cInclude, or addCSourceFile.
- */
 const SOURCE_EXTENSIONS = ['.zig', '.c', '.cpp', '.cc', '.cxx', '.h', '.hpp', '.hxx'];
-
-/**
- * Check if a file is a source file (Zig, C, or C++)
- */
-function isSourceFile(fileName: string): boolean {
-    const lowerName = fileName.toLowerCase();
-    return SOURCE_EXTENSIONS.some(ext => lowerName.endsWith(ext));
-}
-
-/**
- * Get the language of a source file
- */
-function getSourceLanguage(fileName: string): 'zig' | 'c' | 'cpp' | 'objc' | 'unknown' {
-    const lowerName = fileName.toLowerCase();
-    if (lowerName.endsWith('.zig')) {
-        return 'zig';
-    } else if (lowerName.endsWith('.c')) {
-        return 'c';
-    } else if (lowerName.endsWith('.cpp') || lowerName.endsWith('.cc') || lowerName.endsWith('.cxx')) {
-        return 'cpp';
-    } else if (lowerName.endsWith('.m') || lowerName.endsWith('.mm')) {
-        return 'objc';
-    } else {
-        return 'unknown';
-    }
-}
-
-/**
- * Discover all source files (.zig, .c, .cpp, etc.) in the workspace.
- * Excludes zig-cache and zig-out directories.
- */
-export function discoverSourceFiles(workspaceRoot: string): string[] {
-    const sourceFiles: string[] = [];
-
-    try {
-        const entries = fs.readdirSync(workspaceRoot, { withFileTypes: true });
-
-        // Check for 'src' directory
-        const srcPath = path.join(workspaceRoot, 'src');
-        if (fs.existsSync(srcPath)) {
-            const stats = fs.statSync(srcPath);
-            if (stats.isDirectory()) {
-                collectSourceFiles(srcPath, sourceFiles, workspaceRoot);
-            }
-        }
-
-        // Check for 'include' directory (common for C/C++ headers)
-        const includePath = path.join(workspaceRoot, 'include');
-        if (fs.existsSync(includePath)) {
-            const stats = fs.statSync(includePath);
-            if (stats.isDirectory()) {
-                collectSourceFiles(includePath, sourceFiles, workspaceRoot);
-            }
-        }
-
-        // Also check for source files in root
-        for (const entry of entries) {
-            if (entry.isFile() && isSourceFile(entry.name)) {
-                const fullPath = path.join(workspaceRoot, entry.name);
-                sourceFiles.push(fullPath);
-            }
-        }
-    } catch {
-        // Ignore errors
-    }
-
-    return sourceFiles;
-}
-
-/**
- * Recursively collect source files (.zig, .c, .cpp, .h, etc.) from a directory
- */
-function collectSourceFiles(dirPath: string, result: string[], workspaceRoot: string): void {
-    try {
-        const entries = fs.readdirSync(dirPath, { withFileTypes: true });
-        for (const entry of entries) {
-            const fullPath = path.join(dirPath, entry.name);
-
-            if (entry.isDirectory()) {
-                // Skip zig-cache, zig-out, and hidden directories
-                if (entry.name === 'zig-cache' || entry.name === 'zig-out' || entry.name.startsWith('.')) {
-                    continue;
-                }
-                // Also skip common C/C++ build directories
-                if (entry.name === 'build' || entry.name === 'cmake-build' || entry.name === 'out') {
-                    continue;
-                }
-                collectSourceFiles(fullPath, result, workspaceRoot);
-            } else if (entry.isFile() && isSourceFile(entry.name)) {
-                result.push(fullPath);
-            }
-        }
-    } catch {
-        // Ignore permission errors
-    }
-}
 
 /**
  * Get the language of a source file based on extension
@@ -401,8 +408,13 @@ export function getSourceFileInfo(
         const name = path.basename(absolutePath);
 
         // Count lines
-        const content = fs.readFileSync(absolutePath, 'utf8');
-        const lineCount = content.split('\n').length;
+        let lineCount: number | undefined;
+        try {
+            const content = fs.readFileSync(absolutePath, 'utf8');
+            lineCount = content.split('\n').length;
+        } catch {
+            // Binary file or unreadable
+        }
 
         return {
             name,
@@ -431,13 +443,10 @@ export function buildBuildGraph(
     summary: BuildSummary,
     workspaceRoot: string
 ): BuildGraphContext {
-    // 1. Get root source files from build.zig
+    // 1. Parse build.zig to get source file mappings
     const buildZigSources = parseBuildZig(workspaceRoot);
 
-    // 2. Discover all .zig files in the workspace
-    const allSourceFiles = discoverSourceFiles(workspaceRoot);
-
-    // 3. Build mapping from artifact name to its compile step
+    // 2. Build mapping from artifact name to its compile step
     const artifactCompileSteps = new Map<string, BuildStep>();
     for (const step of summary.allSteps) {
         if (step.type === 'compile_exe' || step.type === 'compile_lib' || step.type === 'compile_obj') {
@@ -445,34 +454,52 @@ export function buildBuildGraph(
         }
     }
 
-    // 4. Build dependency graph from the build step tree
+    // 3. Build dependency graph from the build step tree
     const dependencyGraph = buildDependencyGraph(summary);
 
-    // 5. Enrich each artifact with source file info
+    // 4. Enrich each artifact with source file info
     const enrichedArtifacts = summary.artifacts.map(artifact => {
         const enriched = { ...artifact };
 
-        // Get root source files from build.zig
-        const rootSources = buildZigSources.get(artifact.name) || [];
-
-        // Collect source files
+        // Get source info from build.zig parsing
+        const sourceInfo = buildZigSources.get(artifact.name);
         const sourceFiles: ArtifactSourceFile[] = [];
 
-        // Add root source files
-        for (const rootSrc of rootSources) {
-            const fullPath = path.isAbsolute(rootSrc)
-                ? rootSrc
-                : path.join(workspaceRoot, rootSrc);
-
-            const info = getSourceFileInfo(fullPath, workspaceRoot, true);
-            if (info) {
-                sourceFiles.push(info);
+        if (sourceInfo) {
+            // Add root source file (Zig)
+            if (sourceInfo.rootSourceFile) {
+                const fullPath = path.isAbsolute(sourceInfo.rootSourceFile)
+                    ? sourceInfo.rootSourceFile
+                    : path.join(workspaceRoot, sourceInfo.rootSourceFile);
+                const info = getSourceFileInfo(fullPath, workspaceRoot, true);
+                if (info) {
+                    sourceFiles.push(info);
+                }
             }
-        }
 
-        // If no root sources found from build.zig, try to find root source
-        // from the common patterns: src/{artifact_name}.zig or src/main.zig
-        if (rootSources.length === 0) {
+            // Add C/C++ source files from addCSourceFiles
+            const rootPath = path.join(workspaceRoot, '.');
+            for (const srcPath of sourceInfo.cSourceFiles) {
+                const fullPath = path.isAbsolute(srcPath)
+                    ? srcPath
+                    : path.join(rootPath, srcPath);
+                const info = getSourceFileInfo(fullPath, workspaceRoot, false);
+                if (info) {
+                    sourceFiles.push(info);
+                }
+            }
+
+            // Set isDynamic from build.zig analysis
+            if (sourceInfo.isDynamic !== undefined) {
+                enriched.isDynamic = sourceInfo.isDynamic;
+            }
+
+            // Set isTest from build.zig analysis
+            if (sourceInfo.isTest) {
+                enriched.isTest = true;
+            }
+        } else {
+            // Fallback: try to find root source file using common patterns
             const possibleRoots = [
                 path.join(workspaceRoot, 'src', `${artifact.name}.zig`),
                 path.join(workspaceRoot, 'src', 'main.zig'),
@@ -485,19 +512,6 @@ export function buildBuildGraph(
                 if (info) {
                     sourceFiles.push(info);
                     break;
-                }
-            }
-        }
-
-        // Add other .zig files in src/ as "imported" source files
-        for (const srcFile of allSourceFiles) {
-            const isAlreadyAdded = sourceFiles.some(
-                sf => sf.absolutePath === srcFile
-            );
-            if (!isAlreadyAdded) {
-                const info = getSourceFileInfo(srcFile, workspaceRoot, false);
-                if (info) {
-                    sourceFiles.push(info);
                 }
             }
         }
@@ -536,7 +550,6 @@ export function buildBuildGraph(
 export function buildDependencyGraph(summary: BuildSummary): Map<string, ArtifactDependency[]> {
     const graph = new Map<string, ArtifactDependency[]>();
 
-    // Find all compile steps and their dependency tree
     for (const step of summary.allSteps) {
         if (step.type !== 'compile_exe' && step.type !== 'compile_lib' && step.type !== 'compile_obj') {
             continue;
@@ -545,10 +558,9 @@ export function buildDependencyGraph(summary: BuildSummary): Map<string, Artifac
         const deps: ArtifactDependency[] = [];
 
         // Walk children of the compile step to find dependencies
-        collectCompileDependencies(step, deps, step.name, summary.allSteps, new Set<string>());
+        collectCompileDependencies(step, deps, step.name, new Set<string>());
 
-        // Also check if there's an install step that depends on this compile step,
-        // and then check siblings/ancestors for other compile steps
+        // Also check sibling compile steps
         const parentDeps = findSiblingDependencies(step, summary);
         for (const dep of parentDeps) {
             if (!deps.some(d => d.name === dep.name)) {
@@ -569,7 +581,6 @@ function collectCompileDependencies(
     step: BuildStep,
     deps: ArtifactDependency[],
     excludeName: string,
-    allSteps: BuildStep[],
     visited: Set<string>
 ): void {
     if (visited.has(step.id)) {
@@ -588,8 +599,7 @@ function collectCompileDependencies(
                 });
             }
         }
-        // Recurse into child's children for transitive dependencies
-        collectCompileDependencies(child, deps, excludeName, allSteps, visited);
+        collectCompileDependencies(child, deps, excludeName, visited);
     }
 }
 
@@ -603,8 +613,6 @@ function findSiblingDependencies(
     const deps: ArtifactDependency[] = [];
     const seen = new Set<string>();
 
-    // Look at the build tree to find artifacts that are installed or used
-    // by the same parent step
     if (step.parent) {
         for (const sibling of step.parent.children) {
             if ((sibling.type === 'compile_exe' || sibling.type === 'compile_lib') &&
@@ -625,7 +633,7 @@ function findSiblingDependencies(
 }
 
 // ============================================================================
-// File Size Formatting
+// File Size & Duration Formatting
 // ============================================================================
 
 /**
