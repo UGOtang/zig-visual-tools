@@ -1,12 +1,23 @@
 {
   "name": "zig-visual-tools",
-  "displayName": "zig-visual-tools",
-  "description": "Visual build steps and test explorer for Zig",
-  "version": "0.0.1",
+  "displayName": "Zig Visual Tools",
+  "description": "Visualize Zig build steps, artifacts, source files, and tests in VS Code",
+  "version": "0.1.0",
+  "publisher": "",
+  "license": "MIT",
   "engines": {
     "vscode": "^1.120.0"
   },
+  "keywords": [
+    "zig",
+    "build",
+    "debug",
+    "test",
+    "artifact"
+  ],
   "categories": [
+    "Debuggers",
+    "Testing",
     "Other"
   ],
   "activationEvents": [],

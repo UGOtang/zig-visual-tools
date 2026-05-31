@@ -1,71 +1,75 @@
-# zig-visual-tools README
+# Zig Visual Tools
 
-This is the README for your extension "zig-visual-tools". After writing up a brief description, we recommend including the following sections.
+Visualize Zig build steps, artifacts, and tests directly in VS Code.
 
 ## Features
 
-Describe specific features of your extension including screenshots of your extension in action. Image paths are relative to this README file.
+### Build Targets
 
-For example if there is an image subfolder under your extension project workspace:
+View all available `zig build` steps in a sidebar tree. Click the play button to run any step in a terminal.
 
-\!\[feature X\]\(images/feature-x.png\)
+### Build Artifacts
 
-> Tip: Many popular extensions utilize animations. This is an excellent way to show off your extension! We recommend short, focused animations that are easy to follow.
+After building, browse all compiled artifacts — executables, static/shared libraries — organized by type. Each artifact shows:
+
+- **Source Files**: All `.zig`, `.c`, `.cpp`, `.h` files used to build it (parsed from `build.zig`)
+- **Dependencies**: Other artifacts it links against
+- **Details**: Build mode, target, file size
+
+Inline actions on each artifact:
+
+| Action | Description |
+|--------|-------------|
+| ▶ Run | Execute the artifact in a terminal |
+| 🐛 Debug | Launch a full debug session with breakpoints (GDB or LLDB) |
+| 🔄 Rebuild | Rebuild just this artifact |
+| 📁 Open in Explorer | Reveal the artifact file in your OS file manager |
+
+### Test Explorer
+
+Automatically discovers `test "name"` declarations across all `.zig` files in your workspace. Run individual tests or all at once with native VS Code test UI.
+
+### Build Dependency Graph
+
+Use the graph icon in the Build Artifacts panel header to generate a text-based dependency visualization showing the full artifact tree with source files and dependency chains.
 
 ## Requirements
 
-If you have any requirements or dependencies, add a section describing those and how to install and configure them.
+- **Zig** ≥ 0.11 (tested with 0.16)
+- **GDB** (default debugger) — requires [C/C++ extension](https://marketplace.visualstudio.com/items?itemName=ms-vscode.cpptools)
+- **LLDB** (optional) — requires [CodeLLDB extension](https://marketplace.visualstudio.com/items?itemName=vadimcn.vscode-lldb)
 
 ## Extension Settings
 
-Include if your extension adds any VS Code settings through the `contributes.configuration` extension point.
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `zigVisualTools.debugger` | `"gdb"` | Debugger backend: `"gdb"` (via C/C++ extension) or `"lldb"` (via CodeLLDB) |
 
-For example:
+## Usage
 
-This extension contributes the following settings:
-
-* `myExtension.enable`: Enable/disable this extension.
-* `myExtension.thing`: Set to `blah` to do something.
+1. Open a Zig project containing `build.zig`
+2. Click the Zig icon in the Activity Bar
+3. **Build Targets** panel lists all steps from `zig build --help`
+4. Run `zig build` once, then **Build Artifacts** populates with compiled outputs
+5. Expand any artifact to see its source files and dependencies
+6. Click source files to open them in the editor
+7. Use ▶ / 🐛 / 🔄 buttons on executables to run, debug, or rebuild
 
 ## Known Issues
 
-Calling out known issues can help limit users opening duplicate issues against your extension.
+- Source file mapping relies on parsing `build.zig` text; complex or unconventional build configurations may not be fully captured
+- `zig build uninstall` is not supported on Zig 0.16 (upstream TODO)
 
 ## Release Notes
 
-Users appreciate release notes as you update your extension.
+### 0.1.0
 
-### 1.0.0
+Initial release:
 
-Initial release of ...
-
-### 1.0.1
-
-Fixed issue #.
-
-### 1.1.0
-
-Added features X, Y, and Z.
-
----
-
-## Following extension guidelines
-
-Ensure that you've read through the extensions guidelines and follow the best practices for creating your extension.
-
-* [Extension Guidelines](https://code.visualstudio.com/api/references/extension-guidelines)
-
-## Working with Markdown
-
-You can author your README using Visual Studio Code. Here are some useful editor keyboard shortcuts:
-
-* Split the editor (`Cmd+\` on macOS or `Ctrl+\` on Windows and Linux).
-* Toggle preview (`Shift+Cmd+V` on macOS or `Shift+Ctrl+V` on Windows and Linux).
-* Press `Ctrl+Space` (Windows, Linux, macOS) to see a list of Markdown snippets.
-
-## For more information
-
-* [Visual Studio Code's Markdown Support](http://code.visualstudio.com/docs/languages/markdown)
-* [Markdown Syntax Reference](https://help.github.com/articles/markdown-basics/)
-
-**Enjoy!**
+- Build Targets tree view from `zig build --help`
+- Build Artifacts tree view from `zig build --summary all`
+- Source file mapping parsed from `build.zig` (supports Zig 0.16 module syntax)
+- Artifact dependency graph visualization
+- Test Explorer with file watching
+- Run / Debug / Rebuild actions on artifacts
+- Configurable debugger backend (GDB / LLDB)
