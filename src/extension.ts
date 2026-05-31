@@ -1262,38 +1262,31 @@ class BuildArtifactsProvider implements vscode.TreeDataProvider<ArtifactTreeItem
     }
 
     /**
-     * Create a tree item for a source file
+     * Create a tree item for a source file.
+     * Uses resourceUri so VS Code automatically picks the correct file icon
+     * based on the file extension (.zig, .cc, .c, .h, etc.), matching the
+     * active file icon theme exactly as seen in the Explorer.
      */
     private createSourceFileItem(src: ArtifactSourceFile, artifactName: string): ArtifactTreeItem {
         const rootMarker = src.isRootSource ? ' [root]' : '';
 
-        // Determine icon based on language
-        let icon: vscode.ThemeIcon;
-        switch (src.language) {
-            case 'c':
-                icon = new vscode.ThemeIcon('file-code', new vscode.ThemeColor('debugIcon.breakpointForeground'));
-                break;
-            case 'cpp':
-                icon = new vscode.ThemeIcon('file-code', new vscode.ThemeColor('symbolIcon.classForeground'));
-                break;
-            case 'header':
-                icon = new vscode.ThemeIcon('file-code', new vscode.ThemeColor('symbolIcon.interfaceForeground'));
-                break;
-            case 'zig':
-            default:
-                icon = new vscode.ThemeIcon(src.isRootSource ? 'file-code' : 'file');
-                break;
-        }
-
+        // Use resourceUri to let VS Code auto-select the themed file icon
+        // This makes source file icons identical to Explorer's file icons
         const item = new ArtifactTreeItem(
             `src-${artifactName}-${src.relativePath}`,
             src.name,
             vscode.TreeItemCollapsibleState.None,
             'file',  // contextValue must match package.json menu: viewItem == file
-            icon,
+            undefined,
             undefined,
             src
         );
+
+        // Set resourceUri so VS Code renders the correct file icon for this
+        // file type according to the user's active file icon theme (Seti, etc.)
+        if (src.absolutePath) {
+            item.resourceUri = vscode.Uri.file(src.absolutePath);
+        }
 
         // Show language and line count in description
         const langLabel = src.language === 'zig' ? 'Zig' :
@@ -1417,7 +1410,7 @@ class ArtifactTreeItem extends vscode.TreeItem {
         public readonly label: string,
         public readonly collapsibleState: vscode.TreeItemCollapsibleState,
         public readonly contextValue: string,
-        public readonly iconPath?: vscode.ThemeIcon,
+        public readonly iconPath?: vscode.ThemeIcon | vscode.Uri,
         public readonly artifact?: BuildArtifact,
         public readonly sourceFile?: ArtifactSourceFile
     ) {

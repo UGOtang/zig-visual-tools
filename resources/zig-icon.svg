@@ -1,3 +1,27 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-  <path d="M4 4h16L4 20h16" stroke="#f7a41d"/>
+<svg xmlns="http://www.w3.org/2000/svg"
+     viewBox="0 0 24 24"
+     fill="none">
+
+  <!-- 方正六边形 -->
+  <path
+    d="M4 6.5
+       L4 17.5
+       L12 21
+       L20 17.5
+       L20 6.5
+       L12 3
+       Z"
+    stroke="#FFB000"
+    stroke-width="1.5"
+    stroke-linejoin="round"/>
+
+  <!-- Z 字母 -->
+  <path
+    d="M8.5 8.5H15.5
+       L8.5 15.5H15.5"
+    stroke="#FFB000"
+    stroke-width="2"
+    stroke-linecap="round"
+    stroke-linejoin="round"/>
+
 </svg>
