@@ -421,10 +421,21 @@ async function buildGraphVisualization(
         // Source files
         const sourceFiles = artifact.sourceFiles || [];
         if (sourceFiles.length > 0) {
-            lines.push(`│  Source Files (${sourceFiles.length}):`);
+            // Group by language
+            const byLang = new Map<string, number>();
+            for (const src of sourceFiles) {
+                const lang = src.language || 'unknown';
+                byLang.set(lang, (byLang.get(lang) || 0) + 1);
+            }
+            const langSummary = Array.from(byLang.entries())
+                .map(([lang, count]) => `${count} ${lang}`)
+                .join(', ');
+
+            lines.push(`│  Source Files (${sourceFiles.length}): ${langSummary}`);
             for (const src of sourceFiles) {
                 const rootMarker = src.isRootSource ? ' [root]' : '';
-                lines.push(`│    ├─ ${src.relativePath} (${src.lineCount} lines)${rootMarker}`);
+                const langLabel = src.language ? `[${src.language}] ` : '';
+                lines.push(`│    ├─ ${langLabel}${src.relativePath} (${src.lineCount} lines)${rootMarker}`);
             }
         }
 
@@ -821,6 +832,27 @@ class BuildArtifactsProvider implements vscode.TreeDataProvider<ArtifactTreeItem
         // Source files section
         const sourceFiles = artifact.sourceFiles || [];
         if (sourceFiles.length > 0) {
+            // Count files by language
+            const zigCount = sourceFiles.filter(s => s.language === 'zig').length;
+            const cCount = sourceFiles.filter(s => s.language === 'c').length;
+            const cppCount = sourceFiles.filter(s => s.language === 'cpp').length;
+            const headerCount = sourceFiles.filter(s => s.language === 'header').length;
+
+            // Build description showing breakdown
+            const parts: string[] = [];
+            if (zigCount > 0) {
+                parts.push(`${zigCount} Zig`);
+            }
+            if (cCount > 0) {
+                parts.push(`${cCount} C`);
+            }
+            if (cppCount > 0) {
+                parts.push(`${cppCount} C++`);
+            }
+            if (headerCount > 0) {
+                parts.push(`${headerCount} H`);
+            }
+
             const srcFolder = new ArtifactTreeItem(
                 `sources-${artifact.name}`,
                 `Source Files (${sourceFiles.length})`,
@@ -828,20 +860,59 @@ class BuildArtifactsProvider implements vscode.TreeDataProvider<ArtifactTreeItem
                 'source-folder',
                 new vscode.ThemeIcon('file-directory')
             );
+            srcFolder.description = parts.join(', ');
 
             srcFolder.children = sourceFiles.map(src => {
                 const rootMarker = src.isRootSource ? ' [root]' : '';
+
+                // Determine icon based on language
+                let icon: vscode.ThemeIcon;
+                switch (src.language) {
+                    case 'c':
+                        icon = new vscode.ThemeIcon('file-code', new vscode.ThemeColor('debugIcon.breakpointForeground'));
+                        break;
+                    case 'cpp':
+                        icon = new vscode.ThemeIcon('file-code', new vscode.ThemeColor('symbolIcon.classForeground'));
+                        break;
+                    case 'header':
+                        icon = new vscode.ThemeIcon('file-code', new vscode.ThemeColor('symbolIcon.interfaceForeground'));
+                        break;
+                    case 'zig':
+                    default:
+                        icon = new vscode.ThemeIcon(src.isRootSource ? 'file-code' : 'file');
+                        break;
+                }
+
                 const item = new ArtifactTreeItem(
                     `src-${src.relativePath}`,
                     src.name,
                     vscode.TreeItemCollapsibleState.None,
                     'source-file',
-                    new vscode.ThemeIcon(src.isRootSource ? 'file-code' : 'file'),
+                    icon,
                     undefined,
                     src
                 );
-                item.description = `${src.lineCount} lines${rootMarker}`;
-                item.tooltip = src.absolutePath;
+
+                // Show language and line count in description
+                const langLabel = src.language === 'zig' ? 'Zig' :
+                                 src.language === 'c' ? 'C' :
+                                 src.language === 'cpp' ? 'C++' :
+                                 src.language === 'header' ? 'Header' :
+                                 src.language === 'objc' ? 'Obj-C' : 'Unknown';
+                item.description = `${langLabel}, ${src.lineCount} lines${rootMarker}`;
+
+                // Build tooltip with more details
+                const tooltipLines = [
+                    `${src.name}`,
+                    `Path: ${src.relativePath}`,
+                    `Language: ${langLabel}`,
+                    `Lines: ${src.lineCount}`
+                ];
+                if (src.isRootSource) {
+                    tooltipLines.push('Type: Root source file');
+                }
+                item.tooltip = tooltipLines.join('\n');
+
                 item.command = {
                     command: 'zig-visual-tools.openSourceFile',
                     title: 'Open Source File',

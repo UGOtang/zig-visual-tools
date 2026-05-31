@@ -94,6 +94,8 @@ export interface ArtifactSourceFile {
     isRootSource: boolean;
     /** Whether this source file is auto-generated (e.g. in zig-cache) */
     isGenerated: boolean;
+    /** Programming language of the source file */
+    language: 'zig' | 'c' | 'cpp' | 'objc' | 'header' | 'unknown';
     /** Number of lines in the source file */
     lineCount?: number;
     /** File size in bytes */

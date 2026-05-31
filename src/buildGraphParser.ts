@@ -161,6 +161,59 @@ export function parseBuildZig(workspaceRoot: string): Map<string, string[]> {
                 }
             }
 
+            // Match: mod.addCSourceFile() and mod.addCSourceFiles() - C/C++ source files
+            // This can be on a module or directly on the artifact
+            if (currentArtifact && (line.includes('.addCSourceFile') || line.includes('.addCSourceFiles'))) {
+                // Try to extract file paths from addCSourceFile or addCSourceFiles calls
+                // Patterns:
+                //   mod.addCSourceFile(b.path("src/foo.c"), &.{"-std=c99"});
+                //   mod.addCSourceFile(.{ .file = b.path("src/foo.c"), .flags = &.{"-std=c99"} });
+                //   mod.addCSourceFiles(&.{"src/foo.c", "src/bar.c"}, &.{"-std=c99"});
+
+                // Single file: addCSourceFile(b.path("..."))
+                const singleFileMatch = line.match(/addCSourceFile\s*\(\s*(?:b\.path\s*\(\s*"([^"]+)"|\.\{\s*\.file\s*=\s*(?:b\.path\s*\(\s*"([^"]+)")|\s*"([^"]+)")/);
+                if (singleFileMatch) {
+                    const srcPath = singleFileMatch[1] || singleFileMatch[2] || singleFileMatch[3];
+                    if (srcPath) {
+                        const sources = artifactSources.get(currentArtifact);
+                        if (sources && !sources.includes(srcPath)) {
+                            sources.push(srcPath);
+                        }
+                    }
+                }
+
+                // Multiple files: addCSourceFiles(&.{"file1.c", "file2.c"})
+                const multiFileMatch = line.match(/addCSourceFiles\s*\(\s*&\.\{\s*([^}]+)\}/);
+                if (multiFileMatch) {
+                    const filesList = multiFileMatch[1];
+                    // Extract all quoted strings from the list
+                    const fileMatches = filesList.matchAll(/"([^"]+\.c)"/g);
+                    const sources = artifactSources.get(currentArtifact);
+                    if (sources) {
+                        for (const match of fileMatches) {
+                            const srcPath = match[1];
+                            if (!sources.includes(srcPath)) {
+                                sources.push(srcPath);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Match: mod.linkLibrary() - for C library dependencies
+            if (currentArtifact && line.includes('.linkLibrary')) {
+                // This indicates a dependency on a C library
+                // The library name might be useful for dependency tracking
+                const libMatch = line.match(/\.linkLibrary\s*\(\s*(\w+)\s*\)/);
+                if (libMatch) {
+                    // Could track external C library dependencies here
+                    // libMatch[1] is the variable name of the library
+                }
+            }
+
+            // Match: @cImport/@cInclude references in the source file detection
+            // These are detected at runtime via source file analysis, not in build.zig parsing
+
             // Reset current artifact when we see certain patterns indicating end of block
             if (currentArtifact && !inArtifactBlock) {
                 if (line.match(/^\s*\)\s*;?/) ||
@@ -213,7 +266,39 @@ function extractBlockText(lines: string[], startIndex: number): string {
 // ============================================================================
 
 /**
- * Discover all .zig source files in the workspace that belong to a project.
+ * Supported source file extensions for Zig projects.
+ * Zig projects often mix Zig with C/C++ code via @cImport, @cInclude, or addCSourceFile.
+ */
+const SOURCE_EXTENSIONS = ['.zig', '.c', '.cpp', '.cc', '.cxx', '.h', '.hpp', '.hxx'];
+
+/**
+ * Check if a file is a source file (Zig, C, or C++)
+ */
+function isSourceFile(fileName: string): boolean {
+    const lowerName = fileName.toLowerCase();
+    return SOURCE_EXTENSIONS.some(ext => lowerName.endsWith(ext));
+}
+
+/**
+ * Get the language of a source file
+ */
+function getSourceLanguage(fileName: string): 'zig' | 'c' | 'cpp' | 'objc' | 'unknown' {
+    const lowerName = fileName.toLowerCase();
+    if (lowerName.endsWith('.zig')) {
+        return 'zig';
+    } else if (lowerName.endsWith('.c')) {
+        return 'c';
+    } else if (lowerName.endsWith('.cpp') || lowerName.endsWith('.cc') || lowerName.endsWith('.cxx')) {
+        return 'cpp';
+    } else if (lowerName.endsWith('.m') || lowerName.endsWith('.mm')) {
+        return 'objc';
+    } else {
+        return 'unknown';
+    }
+}
+
+/**
+ * Discover all source files (.zig, .c, .cpp, etc.) in the workspace.
  * Excludes zig-cache and zig-out directories.
  */
 export function discoverSourceFiles(workspaceRoot: string): string[] {
@@ -227,13 +312,22 @@ export function discoverSourceFiles(workspaceRoot: string): string[] {
         if (fs.existsSync(srcPath)) {
             const stats = fs.statSync(srcPath);
             if (stats.isDirectory()) {
-                collectZigFiles(srcPath, sourceFiles, workspaceRoot);
+                collectSourceFiles(srcPath, sourceFiles, workspaceRoot);
             }
         }
 
-        // Also check for .zig files in root
+        // Check for 'include' directory (common for C/C++ headers)
+        const includePath = path.join(workspaceRoot, 'include');
+        if (fs.existsSync(includePath)) {
+            const stats = fs.statSync(includePath);
+            if (stats.isDirectory()) {
+                collectSourceFiles(includePath, sourceFiles, workspaceRoot);
+            }
+        }
+
+        // Also check for source files in root
         for (const entry of entries) {
-            if (entry.isFile() && entry.name.endsWith('.zig')) {
+            if (entry.isFile() && isSourceFile(entry.name)) {
                 const fullPath = path.join(workspaceRoot, entry.name);
                 sourceFiles.push(fullPath);
             }
@@ -246,9 +340,9 @@ export function discoverSourceFiles(workspaceRoot: string): string[] {
 }
 
 /**
- * Recursively collect .zig files from a directory
+ * Recursively collect source files (.zig, .c, .cpp, .h, etc.) from a directory
  */
-function collectZigFiles(dirPath: string, result: string[], workspaceRoot: string): void {
+function collectSourceFiles(dirPath: string, result: string[], workspaceRoot: string): void {
     try {
         const entries = fs.readdirSync(dirPath, { withFileTypes: true });
         for (const entry of entries) {
@@ -259,13 +353,37 @@ function collectZigFiles(dirPath: string, result: string[], workspaceRoot: strin
                 if (entry.name === 'zig-cache' || entry.name === 'zig-out' || entry.name.startsWith('.')) {
                     continue;
                 }
-                collectZigFiles(fullPath, result, workspaceRoot);
-            } else if (entry.isFile() && entry.name.endsWith('.zig')) {
+                // Also skip common C/C++ build directories
+                if (entry.name === 'build' || entry.name === 'cmake-build' || entry.name === 'out') {
+                    continue;
+                }
+                collectSourceFiles(fullPath, result, workspaceRoot);
+            } else if (entry.isFile() && isSourceFile(entry.name)) {
                 result.push(fullPath);
             }
         }
     } catch {
         // Ignore permission errors
+    }
+}
+
+/**
+ * Get the language of a source file based on extension
+ */
+function getSourceFileLanguage(fileName: string): 'zig' | 'c' | 'cpp' | 'objc' | 'header' | 'unknown' {
+    const lowerName = fileName.toLowerCase();
+    if (lowerName.endsWith('.zig')) {
+        return 'zig';
+    } else if (lowerName.endsWith('.c')) {
+        return 'c';
+    } else if (lowerName.endsWith('.cpp') || lowerName.endsWith('.cc') || lowerName.endsWith('.cxx')) {
+        return 'cpp';
+    } else if (lowerName.endsWith('.m')) {
+        return 'objc';
+    } else if (lowerName.endsWith('.h') || lowerName.endsWith('.hpp') || lowerName.endsWith('.hxx')) {
+        return 'header';
+    } else {
+        return 'unknown';
     }
 }
 
@@ -292,6 +410,7 @@ export function getSourceFileInfo(
             relativePath,
             isRootSource,
             isGenerated: false,
+            language: getSourceFileLanguage(name),
             lineCount,
             fileSize: stats.size
         };
